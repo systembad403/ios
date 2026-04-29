@@ -1,16 +1,32 @@
-# .github/workflows/build-dylib.yml
-name: Build iOS Dylib
-on: [push, workflow_dispatch]
+name: Build iOS 13-17 Dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        working-directory: payloads/ios1317/13_17
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Xcode & iOS SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build coruna_payload.dylib
         run: make
+
+      - name: Ad-hoc codesign
+        run: make sign
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: coruna_payload
-          path: payloads/ios1317/13_17/coruna_payload.dylib
+          name: coruna_payload_dylib
+          path: coruna_payload.dylib
+          retention-days: 7
