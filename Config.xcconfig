@@ -1,5 +1,6 @@
 ARCHS = arm64
 SDKROOT = iphoneos
+IPHONEOS_DEPLOYMENT_TARGET = 17.2
 GCC_OPTIMIZATION_LEVEL = fast
 OTHER_CFLAGS = -Wall -Werror -fvisibility=hidden
 OTHER_LDFLAGS = -dynamiclib -Wl,-init,_coruna_constructor
