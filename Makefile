@@ -39,6 +39,7 @@ LDFLAGS = \
 	-miphoneos-version-min=$(MIN_IOS) \
 	-framework Foundation \
 	-framework Security \
+	-framework IOSurface \
 	-lsqlite3
 
 SRC = $(wildcard src/*.c)
