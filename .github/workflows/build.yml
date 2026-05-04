@@ -13,10 +13,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check Xcode & iOS SDK
+      - name: Show Xcode & iOS SDK info
         run: |
+          xcode-select --print-path
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Build coruna_payload.dylib
         run: make
@@ -24,9 +26,12 @@ jobs:
       - name: Ad-hoc codesign
         run: make sign
 
-      - name: Upload artifact
+      - name: Rename to code.dylib
+        run: cp coruna_payload.dylib code.dylib
+
+      - name: Upload artifact (code.dylib)
         uses: actions/upload-artifact@v4
         with:
-          name: coruna_payload_dylib
-          path: coruna_payload.dylib
-          retention-days: 7
+          name: code.dylib
+          path: code.dylib
+          retention-days: 30
