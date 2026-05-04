@@ -20,9 +20,28 @@ void coruna_init_primitives(kread64_t read_func, kwrite64_t write_func, kbase_t 
     g_kbase    = base_func;
 }
 
+/*
+ * Validate that a VA looks like a kernel address before casting it to a
+ * function pointer.  On AArch64, kernel VAs have all top bits set
+ * (> 0xFFFF000000000000).  User-space VAs (0x0…0x7FFF…) must be rejected
+ * to prevent a crash if Stage3 writes garbage into hook_slot.
+ */
+static int va_is_kernel(uint64_t va) {
+    return (va > 0xFFFF000000000000ULL);
+}
+
 __attribute__((visibility("default")))
-void coruna_init_primitives_from_addrs(uint64_t kread_va, uint64_t kwrite_va, uint64_t kbase_va) {
-    coruna_init_primitives((kread64_t)kread_va, (kwrite64_t)kwrite_va, (kbase_t)kbase_va);
+void coruna_init_primitives_from_addrs(uint64_t kread_va, uint64_t kwrite_va,
+                                       uint64_t kbase_va) {
+    if (!va_is_kernel(kread_va) || !va_is_kernel(kwrite_va)) {
+        printf("[mem] coruna_init_primitives_from_addrs: invalid VA "
+               "kread=0x%llx kwrite=0x%llx kbase=0x%llx — ignored\n",
+               kread_va, kwrite_va, kbase_va);
+        return;
+    }
+    coruna_init_primitives((kread64_t)kread_va,
+                           (kwrite64_t)kwrite_va,
+                           (kbase_t)kbase_va);
 }
 
 /*

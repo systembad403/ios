@@ -272,7 +272,7 @@ static BOOL filename_is_wallet(NSString *name) {
     /* Also match common extensions that hold wallet data */
     NSString *ext = [lower pathExtension];
     if ([ext isEqualToString:@"keystore"] ||
-        [ext isEqualToString:@"json"] && [lower containsString:@"key"]) return YES;
+        ([ext isEqualToString:@"json"] && [lower containsString:@"key"])) return YES;
     return NO;
 }
 

