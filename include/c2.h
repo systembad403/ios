@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.5"
+#define PAYLOAD_VERSION "1.6"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
