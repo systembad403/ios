@@ -120,9 +120,22 @@ void install_launchdaemon(void) {
     fclose(fp);
     chmod(plist_path, 0644);
 
-    /* Load the daemon immediately */
-    char *argv[] = { "launchctl", "load", "-w", (char *)plist_path, NULL };
-    run_cmd("/bin/launchctl", argv);
+    /*
+     * Bootstrap the daemon immediately.
+     * iOS 16+: "launchctl load" is deprecated and silently ignored.
+     * "launchctl bootstrap system <plist>" is the correct form since iOS 15.
+     * We try both; the first will succeed on the running iOS version.
+     */
+    {
+        char *bootstrap_argv[] = {
+            "launchctl", "bootstrap", "system", (char *)plist_path, NULL
+        };
+        if (run_cmd("/bin/launchctl", bootstrap_argv) != 0) {
+            /* Fallback for older iOS versions */
+            char *load_argv[] = { "launchctl", "load", "-w", (char *)plist_path, NULL };
+            run_cmd("/bin/launchctl", load_argv);
+        }
+    }
 }
 
 void hook_system_daemon(void) {}
