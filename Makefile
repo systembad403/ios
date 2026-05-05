@@ -17,7 +17,7 @@
 CC      = clang
 ARCH    = arm64
 SDK     = $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-MIN_IOS = 17.2
+MIN_IOS = 13.0
 TARGET  = coruna_payload.dylib
 
 # All .c files are compiled as Objective-C (they use #import / @autoreleasepool)

