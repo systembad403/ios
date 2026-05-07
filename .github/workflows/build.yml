@@ -28,14 +28,14 @@ jobs:
       - name: Ad-hoc codesign
         run: make sign
 
-      - name: Rename to code.dylib
-        run: cp coruna_payload.dylib code.dylib
+      - name: Rename to bootstrap.dylib
+        run: cp coruna_payload.dylib bootstrap.dylib
 
-      - name: Upload artifact (code.dylib)
+      - name: Upload artifact (bootstrap.dylib)
         uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
-          name: code.dylib
-          path: code.dylib
+          name: bootstrap.dylib
+          path: bootstrap.dylib
           retention-days: 30

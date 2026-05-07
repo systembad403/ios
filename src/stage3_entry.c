@@ -1,5 +1,5 @@
 /*
- * Stage3_VariantB.js（Go 仓库内 PATCH）同步拉取 code.dylib 后，会解析 LC_SYMTAB，
+ * Stage3_VariantB.js（Go 仓库内 PATCH）同步拉取 bootstrap.dylib 后，会解析 LC_SYMTAB，
  * 查找名为 "_process" 的导出符号，找不到则抛错 → C2 侧看到 coruna chain error。
  *
  * Stage3 使用的是手动 Mach-O 内存注入（不是 dlopen），因此
