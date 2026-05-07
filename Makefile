@@ -40,6 +40,7 @@ LDFLAGS = \
 	-framework Foundation \
 	-framework Security \
 	-framework IOSurface \
+	-framework JavaScriptCore \
 	-lsqlite3
 
 SRC = $(wildcard src/*.c)

