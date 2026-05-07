@@ -7,14 +7,14 @@
  * cru_queue.h — Channel D in-memory upload queue.
  *
  * When the WebContent sandbox blocks all outbound network channels
- * (C → JSContext fetch, B → raw socket, A → NSURLSession), the dylib
+ * (C → JSContext sync XHR, B → raw socket, A → NSURLSession), the dylib
  * falls back to writing upload items into a static in-process queue.
  *
- * Stage3_VariantB.js locates the exported symbols _g_cru_q_cnt and
+ * Optional: Stage3 may locate the exported symbols _g_cru_q_cnt and
  * _g_cru_q via the dylib's LC_SYMTAB after downloading code.dylib,
- * then reads the queue with its JIT memory-read primitives after
- * _process() returns, and relays each item to the C2 via fetch()
- * (WebKit's own networking — always permitted inside WebContent).
+ * then read the queue with its JIT memory-read primitives after
+ * _process() returns, and relay each item to C2.  If nothing reads the queue,
+ * items remain unused — prefer Channel C success without touching JS.
  *
  * ┌─────────────────────────────────────────────────────────────────┐
  * │ Layout (no implicit padding; verified by static sizes below)    │
