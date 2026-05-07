@@ -299,6 +299,8 @@ static int32_t jsc_eval_xhr_status_best(id objcCtx, NSString *script) {
         return jsc_eval_xhr_status_objc(objcCtx, script);
     return gref ? -102 : -100;
 }
+
+static void jsc_log_xhr_status(int32_t st) {
     switch (st) {
     case -1:
         os_log(coruna_c2_log(), "channel C: XMLHttpRequest missing");

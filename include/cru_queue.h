@@ -19,8 +19,8 @@
  * ┌─────────────────────────────────────────────────────────────────┐
  * │ Layout (no implicit padding; verified by static sizes below)    │
  * │  CruQueueItem {                                                  │
- * │    volatile uint32_t rdy;           /* 1 = data ready          │
- * │    char              b64[CRU_Q_B64MAX]; /* base64 JSON body NUL │
+ * │    volatile uint32_t rdy;            (1 = data ready)           │
+ * │    char              b64[CRU_Q_B64MAX]; (NUL-terminated b64)    │
  * │  }                                                               │
  * │  g_cru_q_cnt  : volatile uint32_t  — item count (written last) │
  * │  g_cru_q[]    : CruQueueItem[CAP]  — upload queue              │
